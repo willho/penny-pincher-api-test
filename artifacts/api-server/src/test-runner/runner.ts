@@ -13,11 +13,12 @@ export interface StageResult {
   errors: string[];
 }
 
-interface BatchStep {
+export interface BatchStep {
   n: number;
   strategy: "additive" | "unsub-resub";
-  result: "ok" | "fail" | "skip";
+  result: "ok" | "ack-no-trade" | "fail" | "skip";
   ackMs?: number;
+  tradeMs?: number;
   note?: string;
 }
 
@@ -30,7 +31,6 @@ function log(emit: EmitFn, level: string, message: string): void {
 const PUMPPORTAL_WS = () =>
   process.env.PUMPPORTAL_WS_URL ?? "wss://pumpportal.fun/api/data";
 
-/** Open a PumpPortal WS and resolve once open, reject on error. */
 function openWs(): Promise<WebSocket> {
   return new Promise<WebSocket>((resolve, reject) => {
     const ws = new WebSocket(PUMPPORTAL_WS());
@@ -38,6 +38,21 @@ function openWs(): Promise<WebSocket> {
     ws.once("open", () => { clearTimeout(t); resolve(ws); });
     ws.once("error", (e) => { clearTimeout(t); reject(e); });
   });
+}
+
+function stageEnd(
+  emit: EmitFn,
+  results: StageResult[],
+  stage: number,
+  name: string,
+  success: boolean,
+  duration: number,
+  details: Record<string, unknown>,
+  errors: string[]
+): void {
+  const r: StageResult = { stage, name, success, duration, details, errors };
+  results.push(r);
+  emit({ type: "stage-end", stage, name, success, duration, details, errors });
 }
 
 // ─── Stage 1: Mint Collection ──────────────────────────────────────────────
@@ -99,8 +114,7 @@ async function stage1MintCollection(
   }
 
   const duration = Date.now() - stageStart;
-  results.push({ stage: 1, name: stageName, success, duration, details: { mintsCollected: mints.length }, errors });
-  emit({ type: "stage-end", stage: 1, success, duration, errors });
+  stageEnd(emit, results, 1, stageName, success, duration, { mintsCollected: mints.length }, errors);
   return mints;
 }
 
@@ -177,7 +191,7 @@ async function stage2TradeWallets(
     log(emit, "warn", `DexScreener unreachable: ${(e as Error).message}`);
   }
 
-  // ── DexPaprika SSE health check (may be IP-banned in dev) ──
+  // ── DexPaprika SSE health check (warn-only, may be IP-banned in dev) ──
   log(emit, "info", "DexPaprika SSE health check...");
   try {
     const t0 = Date.now();
@@ -195,12 +209,7 @@ async function stage2TradeWallets(
 
   success = wallets.length > 0 && errors.length === 0;
   const duration = Date.now() - stageStart;
-  results.push({
-    stage: 2, name: stageName, success, duration,
-    details: { walletsCollected: wallets.length, mintsSubscribed: mints.length },
-    errors,
-  });
-  emit({ type: "stage-end", stage: 2, success, duration, errors });
+  stageEnd(emit, results, 2, stageName, success, duration, { walletsCollected: wallets.length, mintsSubscribed: mints.length }, errors);
   return wallets;
 }
 
@@ -222,12 +231,13 @@ async function stage3WalletHistory(
   const chainstackKey = process.env.CHAINSTACK_API_KEY;
   const shyftKey = process.env.SHYFT_API_KEY;
 
+  // Chainstack requires at minimum one of: full RPC URL or just the API key
   if (!chainstackRpc && !chainstackKey) {
-    errors.push("CHAINSTACK_RPC_URL (or CHAINSTACK_API_KEY) not configured");
-    log(emit, "error", "✗ Chainstack not configured");
+    errors.push("Neither CHAINSTACK_RPC_URL nor CHAINSTACK_API_KEY is configured — Stage 3 cannot run");
+    log(emit, "error", "✗ No Chainstack credentials configured");
   }
   if (!shyftKey) {
-    errors.push("SHYFT_API_KEY not configured");
+    errors.push("SHYFT_API_KEY not configured — Stage 3 cannot run");
     log(emit, "error", "✗ SHYFT_API_KEY not configured");
   }
 
@@ -301,12 +311,7 @@ async function stage3WalletHistory(
 
   const success = errors.length === 0;
   const duration = Date.now() - stageStart;
-  results.push({
-    stage: 3, name: stageName, success, duration,
-    details: { walletsQueried: Math.min(wallets.length, 3) },
-    errors,
-  });
-  emit({ type: "stage-end", stage: 3, success, duration, errors });
+  stageEnd(emit, results, 3, stageName, success, duration, { walletsQueried: Math.min(wallets.length, 3) }, errors);
 }
 
 // ─── Stage 4: Batch Subscription Capacity Test ────────────────────────────
@@ -323,12 +328,12 @@ async function stage4BatchCapacity(
 
   const stageStart = Date.now();
   const errors: string[] = [];
-  let success = false;
 
-  // ── Build address pools ──
+  // ── Build address pools with sentinel detection ──
   log(emit, "info", "Building address pool (30s collection + DexScreener)...");
   const mintPool = [...new Set(seedMints)];
   const walletPool = [...new Set(seedWallets)];
+  const sentinelMints = new Set<string>();
 
   // Supplement from DexScreener boosts
   try {
@@ -340,28 +345,67 @@ async function stage4BatchCapacity(
         .forEach((b) => { if (!mintPool.includes(b.tokenAddress!)) mintPool.push(b.tokenAddress!); });
       log(emit, "info", `+ DexScreener mints → pool: ${mintPool.length}`);
     }
-  } catch { /* warn omitted for brevity */ }
+  } catch { /* best-effort */ }
 
-  // 30s subscribeNewToken collection for more addresses
+  // 30s collection: subscribeNewToken + subscribeTokenTrade on same connection
+  // to detect actively trading tokens (sentinel mints)
   await new Promise<void>((resolve) => {
     let ws: WebSocket;
     try { ws = new WebSocket(PUMPPORTAL_WS()); } catch { resolve(); return; }
+
     const t = setTimeout(() => { try { ws.close(); } catch { /* ignore */ } }, 30_000);
-    ws.once("open", () => ws.send(JSON.stringify({ method: "subscribeNewToken" })));
+    let tradeSubSent = false;
+
+    ws.once("open", () => {
+      ws.send(JSON.stringify({ method: "subscribeNewToken" }));
+    });
+
     ws.on("message", (data) => {
       try {
         const msg = JSON.parse(data.toString()) as Record<string, unknown>;
-        if (typeof msg.mint === "string" && !mintPool.includes(msg.mint))
+
+        // New token creation
+        if (typeof msg.mint === "string" && !mintPool.includes(msg.mint)) {
           mintPool.push(msg.mint);
-        if (typeof msg.traderPublicKey === "string" && !walletPool.includes(msg.traderPublicKey))
+          // Subscribe to trades for this mint (additive subscription)
+          if (!tradeSubSent && mintPool.length >= 3) {
+            ws.send(JSON.stringify({ method: "subscribeTokenTrade", keys: mintPool.slice(0, 15) }));
+            tradeSubSent = true;
+          }
+        }
+
+        // Trade event — mark this mint as a confirmed sentinel
+        if (typeof msg.mint === "string" && typeof msg.traderPublicKey === "string") {
+          sentinelMints.add(msg.mint);
+          if (!walletPool.includes(msg.traderPublicKey))
+            walletPool.push(msg.traderPublicKey);
+        }
+
+        // Also collect wallets from subscribeAccountTrade-style events
+        if (typeof msg.traderPublicKey === "string" && !walletPool.includes(msg.traderPublicKey)) {
           walletPool.push(msg.traderPublicKey);
+        }
       } catch { /* skip */ }
     });
+
     ws.on("close", () => { clearTimeout(t); resolve(); });
     ws.on("error", () => { clearTimeout(t); resolve(); });
   });
 
-  log(emit, "success", `✓ Pool ready: ${mintPool.length} mints, ${walletPool.length} wallets`);
+  // Sentinels first in the pool (they're confirmed to generate trade events)
+  const sentinelArray = [...sentinelMints].slice(0, 5);
+  const nonSentinels = mintPool.filter((m) => !sentinelMints.has(m));
+  const orderedMintPool = [...sentinelArray, ...nonSentinels];
+  const orderedWalletPool = [...new Set([...seedWallets, ...walletPool])];
+
+  log(emit, "success", [
+    `✓ Pool ready: ${orderedMintPool.length} mints (${sentinelArray.length} sentinels),`,
+    `${orderedWalletPool.length} wallets`,
+  ].join(" "));
+
+  if (sentinelArray.length === 0) {
+    log(emit, "warn", "No sentinel mints found — trade-event confirmation will be skipped; ack-only used");
+  }
 
   // ── Ramp helper ──
   const RAMP_STEPS = [
@@ -374,9 +418,10 @@ async function stage4BatchCapacity(
     subMethod: string,
     unsubMethod: string,
     pool: string[],
+    sentinels: Set<string>,
     label: string
   ): Promise<BatchStep[]> => {
-    log(emit, "section", `── ${label} (${pool.length} addresses available)`);
+    log(emit, "section", `── ${label} (${pool.length} addresses, ${sentinels.size} sentinels)`);
     const steps: BatchStep[] = [];
     let prevN = 0;
     let connectionLost = false;
@@ -391,21 +436,24 @@ async function stage4BatchCapacity(
     ws.on("close", () => { connectionLost = true; });
     ws.on("error", () => { connectionLost = true; });
 
-    // Callback for the next expected ack
+    // Callbacks for pending operations
     let ackCb: ((msg: Record<string, unknown>) => void) | null = null;
+    let tradeCb: ((msg: Record<string, unknown>) => void) | null = null;
     ws.on("message", (data) => {
       try {
         const msg = JSON.parse(data.toString()) as Record<string, unknown>;
         if (ackCb) ackCb(msg);
+        if (tradeCb) tradeCb(msg);
       } catch { /* skip */ }
     });
 
+    // Wait for a subscription acknowledgment (fast, ~100ms)
     const waitAck = (ms = 3_000): Promise<{ ok: boolean; ms: number; note?: string }> =>
       new Promise((resolve) => {
         const t0 = Date.now();
         const timer = setTimeout(() => {
           ackCb = null;
-          resolve({ ok: false, ms: Date.now() - t0, note: "timeout — no ack" });
+          resolve({ ok: false, ms: Date.now() - t0, note: "no ack" });
         }, ms);
         ackCb = (msg) => {
           const text = typeof msg.message === "string" ? msg.message : "";
@@ -418,6 +466,29 @@ async function stage4BatchCapacity(
           }
         };
       });
+
+    // Wait for a trade event from one of the sentinel addresses (5s)
+    const waitTrade = (keys: string[], ms = 5_000): Promise<{ ok: boolean; ms: number; note?: string }> => {
+      const keySet = new Set(keys);
+      return new Promise((resolve) => {
+        const t0 = Date.now();
+        const timer = setTimeout(() => {
+          tradeCb = null;
+          resolve({ ok: false, ms: Date.now() - t0, note: "timeout — no trade event in 5s" });
+        }, ms);
+        tradeCb = (msg) => {
+          const tradeKey = (msg.mint ?? msg.account ?? msg.wallet) as string | undefined;
+          if (tradeKey && keySet.has(tradeKey)) {
+            clearTimeout(timer); tradeCb = null;
+            resolve({ ok: true, ms: Date.now() - t0 });
+          }
+          if (msg.errors) {
+            clearTimeout(timer); tradeCb = null;
+            resolve({ ok: false, ms: Date.now() - t0, note: JSON.stringify(msg.errors) });
+          }
+        };
+      });
+    };
 
     for (const n of RAMP_STEPS) {
       if (connectionLost) {
@@ -433,87 +504,108 @@ async function stage4BatchCapacity(
       }
 
       const keys = pool.slice(0, n);
+      const activeSentinels = keys.filter((k) => sentinels.has(k));
 
-      // For steps 1-10: test additive strategy too (no unsub)
+      // For steps 1-10: also test additive (no unsub before sending)
       if (n <= 10 && prevN > 0) {
         ws.send(JSON.stringify({ method: subMethod, keys }));
         const ack = await waitAck(3_000);
-        steps.push({ n, strategy: "additive", result: ack.ok ? "ok" : "fail", ackMs: ack.ms, note: ack.note });
+        steps.push({ n, strategy: "additive", result: ack.ok ? "ack-no-trade" : "fail", ackMs: ack.ms, note: ack.note ?? "ack only (no trade wait for additive)" });
         log(emit, ack.ok ? "success" : "warn",
-          `  N=${n} additive: ${ack.ok ? `✓ ${ack.ms}ms` : `⚠ ${ack.note ?? "no ack"}`}`
+          `  N=${n} additive: ${ack.ok ? `✓ ack ${ack.ms}ms` : `⚠ ${ack.note ?? "no ack"}`}`
         );
       }
 
       // Unsub+Resub strategy
       if (prevN > 0) {
         ws.send(JSON.stringify({ method: unsubMethod, keys: pool.slice(0, prevN) }));
-        await new Promise((r) => setTimeout(r, 150));
+        await new Promise((r) => setTimeout(r, 200));
       }
       ws.send(JSON.stringify({ method: subMethod, keys }));
-      const ack = await waitAck(4_000);
 
-      steps.push({ n, strategy: "unsub-resub", result: ack.ok ? "ok" : "fail", ackMs: ack.ms, note: ack.note });
-      log(emit, ack.ok ? "success" : "error",
-        `  N=${n} unsub+resub: ${ack.ok ? `✓ ${ack.ms}ms` : `✗ ${ack.note ?? "no ack"}`}`
-      );
-
+      // Get ack first
+      const ack = await waitAck(3_000);
       if (!ack.ok) {
-        errors.push(`${label}: failed at N=${n} (${ack.note ?? "no ack"})`);
+        // Subscription was rejected
+        steps.push({ n, strategy: "unsub-resub", result: "fail", ackMs: ack.ms, note: ack.note });
+        log(emit, "error", `  N=${n} unsub+resub: ✗ ack failed — ${ack.note ?? "no ack"}`);
+        errors.push(`${label}: subscription rejected at N=${n} (${ack.note ?? "no ack"})`);
         break;
       }
+
+      // If we have active sentinels in this batch, wait for a trade event (true confirmation)
+      let tradeResult: { ok: boolean; ms: number; note?: string } | null = null;
+      if (activeSentinels.length > 0) {
+        tradeResult = await waitTrade(activeSentinels, 5_000);
+      }
+
+      if (tradeResult && tradeResult.ok) {
+        steps.push({ n, strategy: "unsub-resub", result: "ok", ackMs: ack.ms, tradeMs: tradeResult.ms });
+        log(emit, "success", `  N=${n} unsub+resub: ✓ ack ${ack.ms}ms, trade ${tradeResult.ms}ms`);
+      } else if (tradeResult && !tradeResult.ok) {
+        // Ack received but no trade event — subscription was acknowledged but delivery unconfirmed
+        steps.push({ n, strategy: "unsub-resub", result: "ack-no-trade", ackMs: ack.ms, note: tradeResult.note });
+        log(emit, "warn", `  N=${n} unsub+resub: ⚠ ack ${ack.ms}ms, ${tradeResult.note}`);
+      } else {
+        // No sentinels in batch — can only confirm via ack
+        steps.push({ n, strategy: "unsub-resub", result: "ack-no-trade", ackMs: ack.ms, note: "no sentinel in batch" });
+        log(emit, "success", `  N=${n} unsub+resub: ✓ ack ${ack.ms}ms (no sentinel in batch)`);
+      }
+
       prevN = n;
     }
 
     try { ws.close(); } catch { /* ignore */ }
 
-    const maxOk = steps
-      .filter((s) => s.strategy === "unsub-resub" && s.result === "ok")
-      .map((s) => s.n);
-    const max = maxOk.length ? Math.max(...maxOk) : 0;
-    const addOk = steps.filter((s) => s.strategy === "additive" && s.result === "ok").length;
-    const addTested = steps.filter((s) => s.strategy === "additive").length;
-    log(emit, max > 0 ? "success" : "error", `  ▶ Max confirmed (unsub+resub): ${max} keys`);
-    if (addTested > 0)
-      log(emit, "info", `  ▶ Additive worked: ${addOk}/${addTested} steps`);
+    const maxTradeConfirmed = steps.filter((s) => s.strategy === "unsub-resub" && s.result === "ok").map((s) => s.n);
+    const maxAckConfirmed = steps.filter((s) => s.strategy === "unsub-resub" && (s.result === "ok" || s.result === "ack-no-trade")).map((s) => s.n);
+    const max = maxTradeConfirmed.length ? Math.max(...maxTradeConfirmed) : 0;
+    const maxAck = maxAckConfirmed.length ? Math.max(...maxAckConfirmed) : 0;
+    const failPoints = steps.filter((s) => s.result === "fail").map((s) => s.n);
+
+    log(emit, "success", `  ▶ Max trade-confirmed: ${max} keys | Max ack-confirmed: ${maxAck} keys${failPoints.length ? ` | First fail: N=${failPoints[0]}` : ""}`);
 
     return steps;
   };
 
   let tokenSteps: BatchStep[] = [];
   let walletSteps: BatchStep[] = [];
+  let runError: string | null = null;
 
   try {
     tokenSteps = await runRamp(
       "subscribeTokenTrade", "unsubscribeTokenTrade",
-      mintPool, "subscribeTokenTrade"
+      orderedMintPool, sentinelMints,
+      "subscribeTokenTrade"
     );
+
+    // For wallet ramp, use seedWallets as sentinels (known active from Stage 2)
+    const walletSentinels = new Set(seedWallets.slice(0, 5));
     walletSteps = await runRamp(
       "subscribeAccountTrade", "unsubscribeAccountTrade",
-      walletPool, "subscribeAccountTrade"
+      orderedWalletPool, walletSentinels,
+      "subscribeAccountTrade"
     );
-    success = true;
   } catch (e) {
-    errors.push((e as Error).message);
-    log(emit, "error", `Stage 4 error: ${(e as Error).message}`);
+    runError = (e as Error).message;
+    errors.push(runError);
+    log(emit, "error", `Stage 4 error: ${runError}`);
   }
 
   const maxToken = Math.max(0, ...tokenSteps.filter((s) => s.strategy === "unsub-resub" && s.result === "ok").map((s) => s.n));
   const maxWallet = Math.max(0, ...walletSteps.filter((s) => s.strategy === "unsub-resub" && s.result === "ok").map((s) => s.n));
 
+  const success = errors.length === 0;
   const duration = Date.now() - stageStart;
-  results.push({
-    stage: 4, name: stageName, success, duration,
-    details: {
-      mintPoolSize: mintPool.length,
-      walletPoolSize: walletPool.length,
-      maxTokenBatchConfirmed: maxToken,
-      maxWalletBatchConfirmed: maxWallet,
-      tokenSteps,
-      walletSteps,
-    },
-    errors,
-  });
-  emit({ type: "stage-end", stage: 4, success, duration, errors });
+  stageEnd(emit, results, 4, stageName, success, duration, {
+    mintPoolSize: orderedMintPool.length,
+    walletPoolSize: orderedWalletPool.length,
+    sentinelMints: sentinelArray.length,
+    maxTokenBatchConfirmed: maxToken,
+    maxWalletBatchConfirmed: maxWallet,
+    tokenSteps,
+    walletSteps,
+  }, errors);
 }
 
 // ─── Main Exports ──────────────────────────────────────────────────────────
@@ -522,7 +614,7 @@ export async function runAllStages(emit: EmitFn): Promise<void> {
   const startTime = Date.now();
   const results: StageResult[] = [];
 
-  emit({ type: "log", level: "header", message: "════════════ PENNY-PINCHER API TEST SUITE ════════════" });
+  log(emit, "header", "════════════ PENNY-PINCHER API TEST SUITE ════════════");
 
   const mints = await stage1MintCollection(emit, results);
   if (mints.length === 0) {
@@ -548,7 +640,11 @@ export async function runSyntaxTests(emit: EmitFn): Promise<void> {
   let passed = 0;
   let failed = 0;
 
-  const check = async (provider: string, method: string, fn: () => Promise<{ ok: boolean; note?: string }>) => {
+  const check = async (
+    provider: string,
+    method: string,
+    fn: () => Promise<{ ok: boolean; note?: string }>
+  ) => {
     try {
       const r = await fn();
       r.ok ? passed++ : failed++;
@@ -561,32 +657,25 @@ export async function runSyntaxTests(emit: EmitFn): Promise<void> {
 
   await check("DexScreener", "token-boosts/latest/v1", async () => {
     const resp = await fetch("https://api.dexscreener.com/token-boosts/latest/v1");
-    const ok = resp.ok;
-    const note = ok ? undefined : `HTTP ${resp.status}`;
-    return { ok, note };
+    return { ok: resp.ok, note: resp.ok ? undefined : `HTTP ${resp.status}` };
   });
 
   await check("DexPaprika", "sse/trades", async () => {
-    const resp = await fetch("https://api.dexpaprika.com/v1/sse/trades?tokens=So11111111111111111111111111111111111111112", {
-      signal: AbortSignal.timeout(5_000),
-    });
+    const resp = await fetch(
+      "https://api.dexpaprika.com/v1/sse/trades?tokens=So11111111111111111111111111111111111111112",
+      { signal: AbortSignal.timeout(5_000) }
+    );
     const ok = resp.ok || resp.status === 200;
     return { ok, note: ok ? undefined : `HTTP ${resp.status} (may be IP-banned in dev)` };
   });
 
   await check("PumpPortal", "wss-connect", async () => {
-    const ws = await openWs().catch((e) => { throw e; });
+    const ws = await openWs();
     ws.close();
     return { ok: true };
   });
 
-  emit({
-    type: "complete",
-    passed,
-    failed,
-    totalDuration: Date.now() - startTime,
-    results: [],
-  });
+  emit({ type: "complete", passed, failed, totalDuration: Date.now() - startTime, results: [] });
 }
 
 function emitComplete(emit: EmitFn, results: StageResult[], totalDuration: number): void {

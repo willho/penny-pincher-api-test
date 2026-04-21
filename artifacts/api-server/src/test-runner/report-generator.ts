@@ -1,16 +1,8 @@
 import * as fs from "fs";
 import * as path from "path";
-import type { StageResult } from "./runner.js";
+import type { StageResult, BatchStep } from "./runner.js";
 
 // ─── Types ─────────────────────────────────────────────────────────────────
-
-interface BatchStep {
-  n: number;
-  strategy: "additive" | "unsub-resub";
-  result: "ok" | "fail" | "skip";
-  ackMs?: number;
-  note?: string;
-}
 
 export interface RunData {
   startedAt: Date;
@@ -24,11 +16,17 @@ export function createRunData(): RunData {
   return { startedAt: new Date(), logLines: [], stages: [] };
 }
 
+/**
+ * Feed an SSE event into the run data accumulator.
+ * - "log" events are appended to logLines
+ * - "complete" events populate stages from event.results (full StageResult array)
+ */
 export function feedEvent(data: RunData, event: Record<string, unknown>): void {
-  if (event.type === "log") {
+  if (event.type === "log" && typeof event.level === "string" && typeof event.message === "string") {
     data.logLines.push(`[${event.level}] ${event.message}`);
-  } else if (event.type === "stage-end") {
-    data.stages.push(event as unknown as StageResult);
+  } else if (event.type === "complete" && Array.isArray(event.results)) {
+    // "complete" carries the full results array with name + details intact
+    data.stages = event.results as StageResult[];
   }
 }
 
@@ -45,87 +43,88 @@ export function saveReport(data: RunData, dir: string): string {
 function buildMarkdown(data: RunData): string {
   const passed = data.stages.filter((s) => s.success).length;
   const failed = data.stages.filter((s) => !s.success).length;
-  const totalMs = data.stages.reduce((acc, s) => acc + s.duration, 0);
+  const totalMs = data.stages.reduce((acc, s) => acc + (s.duration ?? 0), 0);
   const lines: string[] = [];
 
-  const pad = (s: string, w: number) => s.slice(0, w).padEnd(w);
+  const padStr = (s: string, w: number) => s.slice(0, w).padEnd(w);
 
   lines.push("# Penny Pincher API Test Report");
   lines.push(`**Run started:** ${data.startedAt.toISOString()}`);
   lines.push(`**Result:** ${passed} passed, ${failed} failed — ${(totalMs / 1000).toFixed(1)}s total`);
   lines.push("");
 
-  // Stage summary table
-  lines.push("## Stage Summary");
-  lines.push("");
-  lines.push("| Stage | Name | Result | Duration |");
-  lines.push("|-------|------|--------|----------|");
-  for (const s of data.stages) {
-    const icon = s.success ? "✅" : "❌";
-    lines.push(`| ${s.stage} | ${s.name} | ${icon} ${s.success ? "passed" : "failed"} | ${(s.duration / 1000).toFixed(2)}s |`);
-  }
-  lines.push("");
-
-  // Per-stage details
-  for (const s of data.stages) {
-    lines.push(`## Stage ${s.stage}: ${s.name}`);
+  if (data.stages.length === 0) {
+    lines.push("_No stage data recorded (syntax-check run or no stages completed)._");
+    lines.push("");
+  } else {
+    // Stage summary table
+    lines.push("## Stage Summary");
+    lines.push("");
+    lines.push("| Stage | Name | Result | Duration |");
+    lines.push("|-------|------|--------|----------|");
+    for (const s of data.stages) {
+      const icon = s.success ? "✅" : "❌";
+      lines.push(`| ${s.stage} | ${s.name ?? "—"} | ${icon} ${s.success ? "passed" : "failed"} | ${((s.duration ?? 0) / 1000).toFixed(2)}s |`);
+    }
     lines.push("");
 
-    if (s.errors.length > 0) {
-      lines.push("**Errors:**");
-      s.errors.forEach((e) => lines.push(`- ${e}`));
-      lines.push("");
-    }
-
-    // Stage 4: batch capacity tables
-    if (s.stage === 4) {
-      const d = s.details as {
-        mintPoolSize?: number;
-        walletPoolSize?: number;
-        maxTokenBatchConfirmed?: number;
-        maxWalletBatchConfirmed?: number;
-        tokenSteps?: BatchStep[];
-        walletSteps?: BatchStep[];
-      };
-
-      lines.push(`**Address pool:** ${d.mintPoolSize ?? 0} mints, ${d.walletPoolSize ?? 0} wallets`);
-      lines.push(`**Max token subscription confirmed:** ${d.maxTokenBatchConfirmed ?? 0} keys`);
-      lines.push(`**Max wallet subscription confirmed:** ${d.maxWalletBatchConfirmed ?? 0} keys`);
+    // Per-stage details
+    for (const s of data.stages) {
+      lines.push(`## Stage ${s.stage}: ${s.name ?? "—"}`);
       lines.push("");
 
-      if (d.tokenSteps && d.tokenSteps.length > 0) {
-        lines.push("### subscribeTokenTrade Ramp");
-        lines.push("");
-        lines.push(`| ${pad("N", 5)} | ${pad("Strategy", 12)} | ${pad("Result", 8)} | Ack ms | Note |`);
-        lines.push(`|${"-".repeat(7)}|${"-".repeat(14)}|${"-".repeat(10)}|--------|------|`);
-        for (const step of d.tokenSteps) {
-          lines.push(
-            `| ${pad(String(step.n), 5)} | ${pad(step.strategy, 12)} | ${pad(step.result, 8)} | ${step.ackMs ?? "-"} | ${step.note ?? ""} |`
-          );
-        }
+      if (s.errors && s.errors.length > 0) {
+        lines.push("**Errors:**");
+        s.errors.forEach((e) => lines.push(`- ${e}`));
         lines.push("");
       }
 
-      if (d.walletSteps && d.walletSteps.length > 0) {
-        lines.push("### subscribeAccountTrade Ramp");
+      const det = s.details ?? {};
+
+      // Stage 4: batch capacity tables
+      if (s.stage === 4) {
+        const tokenSteps = (det.tokenSteps ?? []) as BatchStep[];
+        const walletSteps = (det.walletSteps ?? []) as BatchStep[];
+
+        lines.push(`**Address pool:** ${det.mintPoolSize ?? 0} mints (${det.sentinelMints ?? 0} sentinels), ${det.walletPoolSize ?? 0} wallets`);
+        lines.push(`**Max token subscription trade-confirmed:** ${det.maxTokenBatchConfirmed ?? 0} keys`);
+        lines.push(`**Max wallet subscription trade-confirmed:** ${det.maxWalletBatchConfirmed ?? 0} keys`);
         lines.push("");
-        lines.push(`| ${pad("N", 5)} | ${pad("Strategy", 12)} | ${pad("Result", 8)} | Ack ms | Note |`);
-        lines.push(`|${"-".repeat(7)}|${"-".repeat(14)}|${"-".repeat(10)}|--------|------|`);
-        for (const step of d.walletSteps) {
-          lines.push(
-            `| ${pad(String(step.n), 5)} | ${pad(step.strategy, 12)} | ${pad(step.result, 8)} | ${step.ackMs ?? "-"} | ${step.note ?? ""} |`
-          );
+
+        if (tokenSteps.length > 0) {
+          lines.push("### subscribeTokenTrade Ramp");
+          lines.push("");
+          lines.push(`| ${padStr("N", 5)} | ${padStr("Strategy", 12)} | ${padStr("Result", 12)} | Ack ms | Trade ms | Note |`);
+          lines.push(`|${"-".repeat(7)}|${"-".repeat(14)}|${"-".repeat(14)}|--------|----------|------|`);
+          for (const step of tokenSteps) {
+            lines.push(
+              `| ${padStr(String(step.n), 5)} | ${padStr(step.strategy, 12)} | ${padStr(step.result, 12)} | ${step.ackMs ?? "-"} | ${step.tradeMs ?? "-"} | ${step.note ?? ""} |`
+            );
+          }
+          lines.push("");
         }
-        lines.push("");
-      }
-    } else {
-      // Generic details
-      const detailEntries = Object.entries(s.details).filter(
-        ([, v]) => !Array.isArray(v) && typeof v !== "object"
-      );
-      if (detailEntries.length > 0) {
-        detailEntries.forEach(([k, v]) => lines.push(`- **${k}:** ${v}`));
-        lines.push("");
+
+        if (walletSteps.length > 0) {
+          lines.push("### subscribeAccountTrade Ramp");
+          lines.push("");
+          lines.push(`| ${padStr("N", 5)} | ${padStr("Strategy", 12)} | ${padStr("Result", 12)} | Ack ms | Trade ms | Note |`);
+          lines.push(`|${"-".repeat(7)}|${"-".repeat(14)}|${"-".repeat(14)}|--------|----------|------|`);
+          for (const step of walletSteps) {
+            lines.push(
+              `| ${padStr(String(step.n), 5)} | ${padStr(step.strategy, 12)} | ${padStr(step.result, 12)} | ${step.ackMs ?? "-"} | ${step.tradeMs ?? "-"} | ${step.note ?? ""} |`
+            );
+          }
+          lines.push("");
+        }
+      } else {
+        // Generic scalar details
+        const scalars = Object.entries(det).filter(
+          ([, v]) => !Array.isArray(v) && typeof v !== "object"
+        );
+        if (scalars.length > 0) {
+          scalars.forEach(([k, v]) => lines.push(`- **${k}:** ${v}`));
+          lines.push("");
+        }
       }
     }
   }
