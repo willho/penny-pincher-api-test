@@ -27,7 +27,13 @@ function loadModules() {
   if (!reportMod) reportMod = require(`${TEST_DIST}/report-generator.js`);
 }
 
-const sseClients = new Map<string, Response[]>();
+interface RunState {
+  clients: Response[];
+  buffer: string[];   // serialised SSE lines already emitted
+  done: boolean;
+}
+
+const sseRuns = new Map<string, RunState>();
 let activeRunId: string | null = null;
 let lastReportPath: string | null = null;
 
@@ -309,7 +315,8 @@ router.post("/run/:mode", async (req: Request, res: Response) => {
   const runId = Date.now().toString();
   activeRunId = runId;
   lastReportPath = null;
-  sseClients.set(runId, []);
+  const state: RunState = { clients: [], buffer: [], done: false };
+  sseRuns.set(runId, state);
 
   res.json({ runId });
 
@@ -318,8 +325,8 @@ router.post("/run/:mode", async (req: Request, res: Response) => {
   const emit: EmitFn = (event) => {
     reportMod!.feedEvent(runData, event);
     const msg = `data: ${JSON.stringify(event)}\n\n`;
-    const clients = sseClients.get(runId) ?? [];
-    for (const c of clients) {
+    state.buffer.push(msg);
+    for (const c of state.clients) {
       try { c.write(msg); } catch { /* client disconnected */ }
     }
   };
@@ -329,22 +336,25 @@ router.post("/run/:mode", async (req: Request, res: Response) => {
   runFn(emit)
     .then(() => {
       lastReportPath = reportMod!.saveReport(runData, REPORTS_DIR);
-      const done = `data: ${JSON.stringify({ type: "server-complete", reportPath: lastReportPath })}\n\n`;
-      const clients = sseClients.get(runId) ?? [];
-      for (const c of clients) {
-        try { c.write(done); c.end(); } catch {}
+      const doneMsg = `data: ${JSON.stringify({ type: "server-complete", reportPath: lastReportPath })}\n\n`;
+      state.buffer.push(doneMsg);
+      state.done = true;
+      for (const c of state.clients) {
+        try { c.write(doneMsg); c.end(); } catch {}
       }
     })
     .catch((err: Error) => {
       const errMsg = `data: ${JSON.stringify({ type: "server-error", error: err.message })}\n\n`;
-      const clients = sseClients.get(runId) ?? [];
-      for (const c of clients) {
+      state.buffer.push(errMsg);
+      state.done = true;
+      for (const c of state.clients) {
         try { c.write(errMsg); c.end(); } catch {}
       }
     })
     .finally(() => {
-      sseClients.delete(runId);
       activeRunId = null;
+      // Keep buffer alive for 60 s so late-joining clients can replay
+      setTimeout(() => sseRuns.delete(runId), 60_000);
     });
 });
 
@@ -361,18 +371,28 @@ router.get("/stream", (req: Request, res: Response) => {
   res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders();
 
-  const clients = sseClients.get(runId);
-  if (!clients) {
+  const state = sseRuns.get(runId);
+  if (!state) {
     res.write('data: {"type":"server-error","error":"Run not found or already complete"}\n\n');
     res.end();
     return;
   }
 
-  clients.push(res);
+  // Replay buffered events (handles fast runs where client connects after completion)
+  for (const msg of state.buffer) {
+    try { res.write(msg); } catch { /* client gone */ }
+  }
+
+  if (state.done) {
+    res.end();
+    return;
+  }
+
+  state.clients.push(res);
 
   req.on("close", () => {
-    const idx = clients.indexOf(res);
-    if (idx !== -1) clients.splice(idx, 1);
+    const idx = state.clients.indexOf(res);
+    if (idx !== -1) state.clients.splice(idx, 1);
   });
 });
 
