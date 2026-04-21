@@ -20,3 +20,15 @@ run = "pnpm --filter @workspace/penny-pincher-tests run dev"
 [services.env]
 PORT = "8000"
 BASE_PATH = "/"
+
+[services.production]
+serve = "static"
+outDir = "dist/public"
+
+[services.production.build]
+args = ["pnpm", "--filter", "@workspace/penny-pincher-tests", "run", "build"]
+
+[services.production.build.env]
+NODE_ENV = "production"
+BASE_PATH = "/"
+PORT = "8000"
