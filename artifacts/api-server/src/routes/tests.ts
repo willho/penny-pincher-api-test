@@ -1,35 +1,16 @@
 import { Router, type Request, type Response } from "express";
 import * as fs from "fs";
 import * as path from "path";
-import { createRequire } from "module";
+import * as url from "url";
+import { runAllStages, runSyntaxTests, type EmitFn } from "../test-runner/runner.js";
+import { createRunData, feedEvent, saveReport } from "../test-runner/report-generator.js";
 
-const require = createRequire(import.meta.url);
-
-const TEST_DIST = "/home/runner/penny-pincher-api-test/dist";
-const REPORTS_DIR = "/home/runner/penny-pincher-api-test/reports";
-
-interface RunEvent {
-  type: string;
-  [key: string]: unknown;
-}
-
-type EmitFn = (event: RunEvent) => void;
-
-let runnerMod: { runAllStages: (emit: EmitFn) => Promise<void>; runSyntaxTests: (emit: EmitFn) => Promise<void> } | null = null;
-let reportMod: {
-  createRunData: () => unknown;
-  feedEvent: (data: unknown, event: RunEvent) => void;
-  saveReport: (data: unknown, dir: string) => string;
-} | null = null;
-
-function loadModules() {
-  if (!runnerMod) runnerMod = require(`${TEST_DIST}/runner.js`);
-  if (!reportMod) reportMod = require(`${TEST_DIST}/report-generator.js`);
-}
+const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
+const REPORTS_DIR = path.resolve(__dirname, "../reports");
 
 interface RunState {
   clients: Response[];
-  buffer: string[];   // serialised SSE lines already emitted
+  buffer: string[];
   done: boolean;
 }
 
@@ -89,7 +70,7 @@ body{background:#0d1117;color:#c9d1d9;font-family:'JetBrains Mono','Fira Code','
 .log-title{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:#8b949e;font-weight:600}
 .streaming-dot{color:#e3b341;font-size:10px;animation:pulse 1s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-.log-body{height:400px;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:1px}
+.log-body{height:500px;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:1px}
 .log-empty{color:#6e7681;text-align:center;padding-top:60px}
 .log-line.info{color:#c9d1d9}
 .log-line.success{color:#3fb950}
@@ -111,29 +92,29 @@ body{background:#0d1117;color:#c9d1d9;font-family:'JetBrains Mono','Fira Code','
 <div class="main">
   <div class="controls">
     <button class="btn btn-primary" id="btn-all" onclick="startRun('all')">▶ Run All Stages</button>
-    <button class="btn btn-secondary" id="btn-syntax" onclick="startRun('syntax')">🔍 Syntax Tests Only</button>
+    <button class="btn btn-secondary" id="btn-syntax" onclick="startRun('syntax')">🔍 Quick Health Check</button>
     <button class="btn btn-download" id="btn-download" style="display:none" onclick="downloadReport()">⬇ Download Report</button>
   </div>
   <div id="error-box" class="error-box" style="display:none"></div>
   <div id="stages" class="stages" style="display:none">
     <div class="stage-card" id="stage-1">
       <div class="stage-num">Stage 1</div>
-      <div class="stage-name">Token Resolution</div>
+      <div class="stage-name">Mint Collection</div>
       <div class="stage-status pending">· pending</div>
     </div>
     <div class="stage-card" id="stage-2">
       <div class="stage-num">Stage 2</div>
-      <div class="stage-name">Balance Checks</div>
+      <div class="stage-name">Trade Wallet Collection</div>
       <div class="stage-status pending">· pending</div>
     </div>
     <div class="stage-card" id="stage-3">
       <div class="stage-num">Stage 3</div>
-      <div class="stage-name">Swap Quotes</div>
+      <div class="stage-name">Wallet History (Chainstack + Shyft)</div>
       <div class="stage-status pending">· pending</div>
     </div>
     <div class="stage-card" id="stage-4">
       <div class="stage-num">Stage 4</div>
-      <div class="stage-name">Transaction Simulation</div>
+      <div class="stage-name">Batch Subscription Capacity</div>
       <div class="stage-status pending">· pending</div>
     </div>
   </div>
@@ -153,9 +134,6 @@ body{background:#0d1117;color:#c9d1d9;font-family:'JetBrains Mono','Fira Code','
 </div>
 <script>
 let running = false;
-let mode = 'all';
-let logLines = [];
-let logId = 0;
 let syntaxPass = 0, syntaxFail = 0;
 
 function setRunning(val) {
@@ -171,9 +149,7 @@ function showError(msg) {
   el.style.display = 'block';
 }
 
-function hideError() {
-  document.getElementById('error-box').style.display = 'none';
-}
+function hideError() { document.getElementById('error-box').style.display = 'none'; }
 
 function addLog(level, message) {
   const body = document.getElementById('log-body');
@@ -188,7 +164,6 @@ function addLog(level, message) {
 
 function resetUI() {
   document.getElementById('log-body').innerHTML = '';
-  logLines = [];
   syntaxPass = 0; syntaxFail = 0;
   document.getElementById('syntax-pass').textContent = '0';
   document.getElementById('syntax-fail').textContent = '0';
@@ -207,7 +182,6 @@ function resetUI() {
 
 async function startRun(m) {
   if (running) return;
-  mode = m;
   resetUI();
   document.getElementById('stages').style.display = m === 'all' ? 'grid' : 'none';
   document.getElementById('syntax-results').style.display = m === 'syntax' ? 'flex' : 'none';
@@ -256,8 +230,8 @@ async function startRun(m) {
         addLog(event.passed ? 'success' : 'error',
           (event.passed ? '✓' : '✗') + ' ' + event.provider + '/' + event.method + (event.error ? ': ' + event.error : ''));
       } else if (event.type === 'complete') {
-        const badge = document.getElementById('summary-badge');
         const ok = event.failed === 0;
+        const badge = document.getElementById('summary-badge');
         badge.innerHTML = '<span class="status-badge ' + (ok ? 'status-pass' : 'status-fail') + '">' +
           event.passed + '/' + (event.passed + event.failed) + ' passed · ' + (event.totalDuration/1000).toFixed(1) + 's</span>';
         setRunning(false);
@@ -305,37 +279,31 @@ router.post("/run/:mode", async (req: Request, res: Response) => {
     return;
   }
 
-  try {
-    loadModules();
-  } catch (e) {
-    res.status(500).json({ error: `Failed to load test runner: ${(e as Error).message}` });
-    return;
-  }
-
   const runId = Date.now().toString();
   activeRunId = runId;
   lastReportPath = null;
+
   const state: RunState = { clients: [], buffer: [], done: false };
   sseRuns.set(runId, state);
 
   res.json({ runId });
 
-  const runData = reportMod!.createRunData();
+  const runData = createRunData();
 
   const emit: EmitFn = (event) => {
-    reportMod!.feedEvent(runData, event);
+    feedEvent(runData, event as Record<string, unknown>);
     const msg = `data: ${JSON.stringify(event)}\n\n`;
     state.buffer.push(msg);
     for (const c of state.clients) {
-      try { c.write(msg); } catch { /* client disconnected */ }
+      try { c.write(msg); } catch { /* disconnected */ }
     }
   };
 
-  const runFn = mode === "all" ? runnerMod!.runAllStages : runnerMod!.runSyntaxTests;
+  const runFn = mode === "all" ? runAllStages : runSyntaxTests;
 
   runFn(emit)
     .then(() => {
-      lastReportPath = reportMod!.saveReport(runData, REPORTS_DIR);
+      lastReportPath = saveReport(runData, REPORTS_DIR);
       const doneMsg = `data: ${JSON.stringify({ type: "server-complete", reportPath: lastReportPath })}\n\n`;
       state.buffer.push(doneMsg);
       state.done = true;
@@ -353,7 +321,6 @@ router.post("/run/:mode", async (req: Request, res: Response) => {
     })
     .finally(() => {
       activeRunId = null;
-      // Keep buffer alive for 60 s so late-joining clients can replay
       setTimeout(() => sseRuns.delete(runId), 60_000);
     });
 });
@@ -373,23 +340,18 @@ router.get("/stream", (req: Request, res: Response) => {
 
   const state = sseRuns.get(runId);
   if (!state) {
-    res.write('data: {"type":"server-error","error":"Run not found or already complete"}\n\n');
+    res.write('data: {"type":"server-error","error":"Run not found or already expired"}\n\n');
     res.end();
     return;
   }
 
-  // Replay buffered events (handles fast runs where client connects after completion)
   for (const msg of state.buffer) {
-    try { res.write(msg); } catch { /* client gone */ }
+    try { res.write(msg); } catch { /* gone */ }
   }
 
-  if (state.done) {
-    res.end();
-    return;
-  }
+  if (state.done) { res.end(); return; }
 
   state.clients.push(res);
-
   req.on("close", () => {
     const idx = state.clients.indexOf(res);
     if (idx !== -1) state.clients.splice(idx, 1);
@@ -405,10 +367,7 @@ router.get("/report/download", (_req: Request, res: Response) => {
 });
 
 router.get("/reports", (_req: Request, res: Response) => {
-  if (!fs.existsSync(REPORTS_DIR)) {
-    res.json([]);
-    return;
-  }
+  if (!fs.existsSync(REPORTS_DIR)) { res.json([]); return; }
   const files = fs.readdirSync(REPORTS_DIR)
     .filter((f) => f.endsWith(".md"))
     .sort()
