@@ -24,12 +24,5 @@ BASE_PATH = "/"
 [services.production]
 serve = "static"
 publicDir = "artifacts/penny-pincher-tests/dist/public"
+build = ["pnpm", "--filter", "@workspace/penny-pincher-tests", "run", "build"]
 rewrites = [{ from = "/*", to = "/index.html" }]
-
-[services.production.build]
-args = ["pnpm", "--filter", "@workspace/penny-pincher-tests", "run", "build"]
-
-[services.production.build.env]
-NODE_ENV = "production"
-BASE_PATH = "/"
-PORT = "8000"
