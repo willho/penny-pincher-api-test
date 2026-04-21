@@ -1,5 +1,5 @@
 kind = "web"
-previewPath = "/penny-pincher-tests/"
+previewPath = "/"
 title = "Penny Pincher API Tests"
 version = "1.0.0"
 id = "artifacts/penny-pincher-tests"
@@ -11,7 +11,7 @@ version = "1.0.0"
 
 [[services]]
 name = "web"
-paths = [ "/penny-pincher-tests/" ]
+paths = [ "/" ]
 localPort = 8000
 
 [services.development]
@@ -19,4 +19,4 @@ run = "pnpm --filter @workspace/penny-pincher-tests run dev"
 
 [services.env]
 PORT = "8000"
-BASE_PATH = "/penny-pincher-tests/"
+BASE_PATH = "/"

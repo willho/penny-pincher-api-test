@@ -619,6 +619,305 @@ async function stage4BatchCapacity(
   }, errors);
 }
 
+// ─── Stage 5: DexPaprika SSE Trade Stream ──────────────────────────────────
+
+async function stage5DexPaprika(
+  emit: EmitFn,
+  results: StageResult[],
+  bondingMints: string[]
+): Promise<void> {
+  const stageName = "Stage 5: DexPaprika SSE Trade Stream";
+  emit({ type: "stage-start", stage: 5, name: stageName });
+  log(emit, "header", "════ " + stageName);
+
+  const stageStart = Date.now();
+  const errors: string[] = [];
+
+  // Use the first 5 bonding-curve mints from Stage 1 (PumpFun tokens)
+  const testMints = bondingMints.slice(0, 5);
+  if (testMints.length === 0) {
+    errors.push("No bonding-curve mints available from Stage 1 — cannot test DexPaprika");
+    log(emit, "error", "✗ No mints to test with");
+    stageEnd(emit, results, 5, stageName, false, Date.now() - stageStart, { mintsProvided: 0 }, errors);
+    return;
+  }
+
+  log(emit, "info", `Testing DexPaprika SSE with ${testMints.length} PumpFun bonding-curve mint(s)`);
+  log(emit, "info", `Mints: ${testMints.map((m) => m.slice(0, 16) + "...").join(", ")}`);
+
+  const STREAM_URL = `https://api.dexpaprika.com/v1/sse/trades?tokens=${testMints.join(",")}`;
+  log(emit, "info", `Connecting to DexPaprika SSE: ${STREAM_URL.slice(0, 80)}...`);
+
+  let eventsReceived = 0;
+  let connectOk = false;
+  let firstEventMs: number | undefined;
+  let httpStatus: number | undefined;
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15_000);
+    const t0 = Date.now();
+
+    const resp = await fetch(STREAM_URL, {
+      signal: controller.signal,
+      headers: { Accept: "text/event-stream" },
+    });
+
+    clearTimeout(timeoutId);
+    httpStatus = resp.status;
+
+    if (!resp.ok && resp.status !== 200) {
+      errors.push(`DexPaprika SSE HTTP ${resp.status} — may be IP-banned in this environment`);
+      log(emit, "warn", `⚠ DexPaprika HTTP ${resp.status} — likely IP-restricted in dev (verify in production)`);
+      stageEnd(emit, results, 5, stageName, false, Date.now() - stageStart, {
+        httpStatus,
+        mintsProvided: testMints.length,
+        eventsReceived: 0,
+        note: "IP-banned or unreachable from this environment",
+      }, errors);
+      return;
+    }
+
+    connectOk = true;
+    log(emit, "success", `✓ DexPaprika SSE connected (HTTP ${resp.status}, ${Date.now() - t0}ms)`);
+
+    // Read the SSE stream for up to 15s, count trade events
+    const streamController = new AbortController();
+    const streamTimeout = setTimeout(() => streamController.abort(), 15_000);
+
+    try {
+      const reader = resp.body!.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+
+      while (true) {
+        if (streamController.signal.aborted) break;
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+
+        for (const line of lines) {
+          if (!line.startsWith("data:")) continue;
+          const raw = line.slice(5).trim();
+          if (!raw || raw === "connected") continue;
+          try {
+            const evt = JSON.parse(raw) as Record<string, unknown>;
+            // DexPaprika trade events have token + price + amount fields
+            if (evt.token || evt.tokenAddress || evt.mint || evt.price !== undefined) {
+              eventsReceived++;
+              if (eventsReceived === 1) {
+                firstEventMs = Date.now() - t0;
+                log(emit, "success", `✓ First trade event in ${firstEventMs}ms — token: ${
+                  (evt.token ?? evt.tokenAddress ?? evt.mint ?? "unknown") as string
+                }`);
+              }
+              if (eventsReceived <= 3) {
+                log(emit, "info", `  event ${eventsReceived}: ${JSON.stringify(evt).slice(0, 120)}`);
+              }
+            }
+          } catch { /* malformed line */ }
+        }
+
+        if (eventsReceived >= 5) break; // Got enough data
+      }
+      reader.cancel().catch(() => { /* ignore */ });
+    } finally {
+      clearTimeout(streamTimeout);
+    }
+
+    if (eventsReceived > 0) {
+      log(emit, "success", `✓ DexPaprika: ${eventsReceived} trade event(s) received for PumpFun bonding mints`);
+    } else {
+      log(emit, "warn", "⚠ DexPaprika connected but no trade events in 15s — tokens may be inactive or IP-restricted");
+      errors.push("No trade events received from DexPaprika in 15s — tokens may be inactive on this provider");
+    }
+  } catch (e) {
+    const msg = (e as Error).message;
+    if (msg.includes("abort") || msg.includes("timeout")) {
+      // Stream read timed out — could be normal (no activity)
+      if (connectOk && eventsReceived === 0) {
+        log(emit, "warn", "⚠ DexPaprika stream opened but no events in 15s — bonding mints may be inactive");
+        errors.push("No trade events in 15s stream window — mints may be inactive");
+      }
+    } else {
+      errors.push(`DexPaprika: ${msg}`);
+      log(emit, "warn", `⚠ DexPaprika: ${msg} — may be IP-banned in dev (verify in production)`);
+    }
+  }
+
+  const success = connectOk && errors.length === 0;
+  stageEnd(emit, results, 5, stageName, success, Date.now() - stageStart, {
+    httpStatus,
+    mintsProvided: testMints.length,
+    eventsReceived,
+    firstEventMs,
+  }, errors);
+}
+
+// ─── Stage 6: Graduated Token Cross-Provider Test ──────────────────────────
+// Tests PumpPortal + PumpDev (pumpdev.io/ws) with mints that have GRADUATED
+// from PumpFun bonding curve onto Raydium/Orca (sourced from DexScreener boosts).
+
+async function stage6GraduatedTokens(
+  emit: EmitFn,
+  results: StageResult[]
+): Promise<void> {
+  const stageName = "Stage 6: Graduated Token Trade Streams (PumpPortal + PumpDev)";
+  emit({ type: "stage-start", stage: 6, name: stageName });
+  log(emit, "header", "════ " + stageName);
+
+  const stageStart = Date.now();
+  const errors: string[] = [];
+
+  // ── Step 1: Fetch graduated mints from DexScreener boosts (Solana) ──
+  log(emit, "info", "Fetching graduated mints from DexScreener boosts...");
+  const graduatedMints: string[] = [];
+
+  try {
+    const resp = await fetch("https://api.dexscreener.com/token-boosts/latest/v1");
+    if (resp.ok) {
+      const boosts = (await resp.json()) as Array<{
+        chainId?: string;
+        tokenAddress?: string;
+        description?: string;
+        url?: string;
+      }>;
+      const solanaMints = boosts
+        .filter((b) => b.chainId === "solana" && typeof b.tokenAddress === "string")
+        .map((b) => b.tokenAddress!);
+      graduatedMints.push(...solanaMints.slice(0, 20)); // cap at 20
+      log(emit, "success", `✓ ${graduatedMints.length} Solana mints from DexScreener boosts`);
+      log(emit, "info", `  Sample: ${graduatedMints.slice(0, 3).map((m) => m.slice(0, 16) + "...").join(", ")}`);
+    } else {
+      errors.push(`DexScreener boosts HTTP ${resp.status}`);
+      log(emit, "error", `✗ DexScreener HTTP ${resp.status}`);
+    }
+  } catch (e) {
+    errors.push(`DexScreener: ${(e as Error).message}`);
+    log(emit, "error", `✗ DexScreener: ${(e as Error).message}`);
+  }
+
+  if (graduatedMints.length === 0) {
+    errors.push("No graduated mints available — cannot test providers");
+    stageEnd(emit, results, 6, stageName, false, Date.now() - stageStart, {
+      graduatedMintCount: 0,
+    }, errors);
+    return;
+  }
+
+  // ── Step 2: Test each provider with graduated mints ──
+  const testProvider = async (
+    name: string,
+    wsUrl: string,
+    mints: string[]
+  ): Promise<{ connected: boolean; ackReceived: boolean; tradeReceived: boolean; firstTradeMs?: number; note?: string }> => {
+    log(emit, "section", `── Testing ${name} (${wsUrl}) with ${mints.length} graduated mints`);
+    const result = { connected: false, ackReceived: false, tradeReceived: false, firstTradeMs: undefined as number | undefined, note: undefined as string | undefined };
+
+    try {
+      const ws = new WebSocket(wsUrl);
+      const t0 = Date.now();
+
+      await new Promise<void>((resolve, reject) => {
+        const connectTimer = setTimeout(() => reject(new Error("WS connect timeout (10s)")), 10_000);
+        ws.once("open", () => { clearTimeout(connectTimer); resolve(); });
+        ws.once("error", (e) => { clearTimeout(connectTimer); reject(e); });
+      });
+
+      result.connected = true;
+      log(emit, "success", `  ✓ Connected to ${name} (${Date.now() - t0}ms)`);
+      ws.send(JSON.stringify({ method: "subscribeTokenTrade", keys: mints }));
+
+      await new Promise<void>((resolve) => {
+        const streamTimer = setTimeout(() => resolve(), 15_000);
+
+        ws.on("message", (data) => {
+          try {
+            const msg = JSON.parse(data.toString()) as Record<string, unknown>;
+
+            // Ack detection (PumpPortal style)
+            const text = typeof msg.message === "string" ? msg.message : "";
+            if (!result.ackReceived && (text.toLowerCase().includes("subscribed") || msg.type === "subscribed")) {
+              result.ackReceived = true;
+              log(emit, "info", `  ✓ ${name}: subscription acknowledged (${Date.now() - t0}ms)`);
+            }
+
+            // Trade event detection — graduated tokens should have mint + txType/price
+            if (!result.tradeReceived && typeof msg.mint === "string" && mints.includes(msg.mint)) {
+              result.tradeReceived = true;
+              result.firstTradeMs = Date.now() - t0;
+              const txType = (msg.txType ?? msg.type ?? "trade") as string;
+              log(emit, "success", `  ✓ ${name}: trade event for graduated mint ${msg.mint.slice(0, 16)}... (${txType}, ${result.firstTradeMs}ms)`);
+              clearTimeout(streamTimer);
+              resolve();
+            }
+
+            if (msg.errors) {
+              result.note = JSON.stringify(msg.errors);
+              log(emit, "warn", `  ⚠ ${name} error msg: ${result.note}`);
+            }
+          } catch { /* skip */ }
+        });
+
+        ws.on("close", () => { clearTimeout(streamTimer); resolve(); });
+        ws.on("error", () => { clearTimeout(streamTimer); resolve(); });
+      });
+
+      try { ws.close(); } catch { /* ignore */ }
+
+      if (!result.tradeReceived) {
+        if (result.ackReceived) {
+          result.note = "Subscribed but no trade event in 15s — graduated tokens may be low-volume";
+          log(emit, "warn", `  ⚠ ${name}: ack received, no trade event in 15s`);
+        } else {
+          result.note = "No ack and no trade event in 15s";
+          log(emit, "warn", `  ⚠ ${name}: no ack and no trade event`);
+        }
+      }
+    } catch (e) {
+      result.note = (e as Error).message;
+      log(emit, "error", `  ✗ ${name}: ${result.note}`);
+    }
+
+    return result;
+  };
+
+  const pumpportalResult = await testProvider(
+    "PumpPortal",
+    process.env.PUMPPORTAL_WS_URL ?? "wss://pumpportal.fun/api/data",
+    graduatedMints
+  );
+
+  const pumpdevResult = await testProvider(
+    "PumpDev",
+    process.env.PUMPDEV_WS_URL ?? "wss://pumpdev.io/ws",
+    graduatedMints
+  );
+
+  // Stage success = both providers connected and at least subscribed
+  const bothConnected = pumpportalResult.connected && pumpdevResult.connected;
+  if (!pumpportalResult.connected) errors.push(`PumpPortal WS connect failed: ${pumpportalResult.note ?? "unknown"}`);
+  if (!pumpdevResult.connected) errors.push(`PumpDev WS connect failed: ${pumpdevResult.note ?? "unknown"}`);
+
+  log(emit, "section", "── Cross-Provider Summary");
+  log(emit, pumpportalResult.tradeReceived ? "success" : "warn",
+    `PumpPortal: connected=${pumpportalResult.connected} ack=${pumpportalResult.ackReceived} trade=${pumpportalResult.tradeReceived}${pumpportalResult.firstTradeMs !== undefined ? ` (${pumpportalResult.firstTradeMs}ms)` : ""}`
+  );
+  log(emit, pumpdevResult.tradeReceived ? "success" : "warn",
+    `PumpDev:    connected=${pumpdevResult.connected} ack=${pumpdevResult.ackReceived} trade=${pumpdevResult.tradeReceived}${pumpdevResult.firstTradeMs !== undefined ? ` (${pumpdevResult.firstTradeMs}ms)` : ""}`
+  );
+
+  const success = bothConnected && errors.length === 0;
+  stageEnd(emit, results, 6, stageName, success, Date.now() - stageStart, {
+    graduatedMintCount: graduatedMints.length,
+    pumpportal: pumpportalResult,
+    pumpdev: pumpdevResult,
+  }, errors);
+}
+
 // ─── Main Exports ──────────────────────────────────────────────────────────
 
 export async function runAllStages(emit: EmitFn): Promise<void> {
@@ -642,6 +941,8 @@ export async function runAllStages(emit: EmitFn): Promise<void> {
 
   await stage3WalletHistory(emit, results, wallets);
   await stage4BatchCapacity(emit, results, mints, wallets);
+  await stage5DexPaprika(emit, results, mints);
+  await stage6GraduatedTokens(emit, results);
 
   emitComplete(emit, results, Date.now() - startTime);
 }
