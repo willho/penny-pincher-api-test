@@ -23,7 +23,8 @@ BASE_PATH = "/"
 
 [services.production]
 serve = "static"
-outDir = "dist/public"
+publicDir = "artifacts/penny-pincher-tests/dist/public"
+rewrites = [{ from = "/*", to = "/index.html" }]
 
 [services.production.build]
 args = ["pnpm", "--filter", "@workspace/penny-pincher-tests", "run", "build"]
