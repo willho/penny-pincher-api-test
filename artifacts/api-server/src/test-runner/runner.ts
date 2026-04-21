@@ -436,55 +436,71 @@ async function stage4BatchCapacity(
     ws.on("close", () => { connectionLost = true; });
     ws.on("error", () => { connectionLost = true; });
 
-    // Callbacks for pending operations
-    let ackCb: ((msg: Record<string, unknown>) => void) | null = null;
-    let tradeCb: ((msg: Record<string, unknown>) => void) | null = null;
+    // Single message callback used by waitConfirmation
+    let msgCb: ((msg: Record<string, unknown>) => void) | null = null;
     ws.on("message", (data) => {
       try {
         const msg = JSON.parse(data.toString()) as Record<string, unknown>;
-        if (ackCb) ackCb(msg);
-        if (tradeCb) tradeCb(msg);
+        if (msgCb) msgCb(msg);
       } catch { /* skip */ }
     });
 
-    // Wait for a subscription acknowledgment (fast, ~100ms)
-    const waitAck = (ms = 3_000): Promise<{ ok: boolean; ms: number; note?: string }> =>
-      new Promise((resolve) => {
-        const t0 = Date.now();
-        const timer = setTimeout(() => {
-          ackCb = null;
-          resolve({ ok: false, ms: Date.now() - t0, note: "no ack" });
-        }, ms);
-        ackCb = (msg) => {
-          const text = typeof msg.message === "string" ? msg.message : "";
-          if (text.toLowerCase().includes("subscribed")) {
-            clearTimeout(timer); ackCb = null;
-            resolve({ ok: true, ms: Date.now() - t0 });
-          } else if (msg.errors) {
-            clearTimeout(timer); ackCb = null;
-            resolve({ ok: false, ms: Date.now() - t0, note: JSON.stringify(msg.errors) });
-          }
-        };
-      });
-
-    // Wait for a trade event from one of the sentinel addresses (5s)
-    const waitTrade = (keys: string[], ms = 5_000): Promise<{ ok: boolean; ms: number; note?: string }> => {
-      const keySet = new Set(keys);
+    /**
+     * Send a subscription and wait up to timeoutMs for confirmation.
+     * Confirmation tiers (best to worst):
+     *   "ok"          — a trade event from a sentinel address arrived
+     *   "ack-no-trade" — subscription ack received but no trade event in window
+     *   "fail"        — explicit errors from PumpPortal, connection closed, or no ack at all
+     */
+    const waitConfirmation = (
+      sentinelKeys: string[],
+      timeoutMs = 5_000
+    ): Promise<{ result: "ok" | "ack-no-trade" | "fail"; ackMs?: number; tradeMs?: number; note?: string }> => {
+      // Build set covering all fields PumpPortal may use to identify the subscribed key:
+      //   - subscribeTokenTrade events carry the token as msg.mint
+      //   - subscribeAccountTrade events carry the wallet as msg.traderPublicKey
+      const sentinelSet = new Set(sentinelKeys);
       return new Promise((resolve) => {
         const t0 = Date.now();
+        let ackMs: number | undefined;
+
         const timer = setTimeout(() => {
-          tradeCb = null;
-          resolve({ ok: false, ms: Date.now() - t0, note: "timeout — no trade event in 5s" });
-        }, ms);
-        tradeCb = (msg) => {
-          const tradeKey = (msg.mint ?? msg.account ?? msg.wallet) as string | undefined;
-          if (tradeKey && keySet.has(tradeKey)) {
-            clearTimeout(timer); tradeCb = null;
-            resolve({ ok: true, ms: Date.now() - t0 });
+          msgCb = null;
+          if (ackMs !== undefined) {
+            resolve({ result: "ack-no-trade", ackMs, note: "timeout — no trade event in 5s" });
+          } else {
+            resolve({ result: "fail", note: "timeout — no ack within 5s" });
           }
+        }, timeoutMs);
+
+        msgCb = (msg) => {
+          // Explicit error from PumpPortal
           if (msg.errors) {
-            clearTimeout(timer); tradeCb = null;
-            resolve({ ok: false, ms: Date.now() - t0, note: JSON.stringify(msg.errors) });
+            clearTimeout(timer); msgCb = null;
+            resolve({ result: "fail", ackMs, note: JSON.stringify(msg.errors) });
+            return;
+          }
+
+          // Trade-event confirmation: check all fields PumpPortal uses for the subscribed key
+          if (sentinelSet.size > 0) {
+            const candidates = [
+              msg.mint,
+              msg.traderPublicKey,  // wallet key used by subscribeAccountTrade
+              msg.account,
+              msg.wallet,
+            ].filter((v): v is string => typeof v === "string");
+            if (candidates.some((k) => sentinelSet.has(k))) {
+              clearTimeout(timer); msgCb = null;
+              resolve({ result: "ok", ackMs, tradeMs: Date.now() - t0 });
+              return;
+            }
+          }
+
+          // Subscription acknowledgment
+          const text = typeof msg.message === "string" ? msg.message : "";
+          if (ackMs === undefined && text.toLowerCase().includes("subscribed")) {
+            ackMs = Date.now() - t0;
+            // Keep waiting for a trade event until the timeout
           }
         };
       });
@@ -506,50 +522,36 @@ async function stage4BatchCapacity(
       const keys = pool.slice(0, n);
       const activeSentinels = keys.filter((k) => sentinels.has(k));
 
-      // For steps 1-10: also test additive (no unsub before sending)
+      // For steps 1-10: also test additive strategy (send new sub without unsubscribing first)
       if (n <= 10 && prevN > 0) {
         ws.send(JSON.stringify({ method: subMethod, keys }));
-        const ack = await waitAck(3_000);
-        steps.push({ n, strategy: "additive", result: ack.ok ? "ack-no-trade" : "fail", ackMs: ack.ms, note: ack.note ?? "ack only (no trade wait for additive)" });
-        log(emit, ack.ok ? "success" : "warn",
-          `  N=${n} additive: ${ack.ok ? `✓ ack ${ack.ms}ms` : `⚠ ${ack.note ?? "no ack"}`}`
+        const c = await waitConfirmation(activeSentinels, 5_000);
+        steps.push({ n, strategy: "additive", result: c.result, ackMs: c.ackMs, tradeMs: c.tradeMs, note: c.note });
+        const icon = c.result === "ok" ? "✓" : c.result === "ack-no-trade" ? "⚠" : "✗";
+        log(emit, c.result === "ok" ? "success" : c.result === "ack-no-trade" ? "warn" : "warn",
+          `  N=${n} additive: ${icon} ${c.result}${c.ackMs !== undefined ? ` ack=${c.ackMs}ms` : ""}${c.tradeMs !== undefined ? ` trade=${c.tradeMs}ms` : ""}${c.note ? ` (${c.note})` : ""}`
         );
+        // Additive failures are informational — do NOT break the ramp
       }
 
-      // Unsub+Resub strategy
+      // Unsub+Resub strategy (primary — always tested)
       if (prevN > 0) {
         ws.send(JSON.stringify({ method: unsubMethod, keys: pool.slice(0, prevN) }));
-        await new Promise((r) => setTimeout(r, 200));
+        await new Promise((r) => setTimeout(r, 200)); // brief settle
       }
       ws.send(JSON.stringify({ method: subMethod, keys }));
+      const c = await waitConfirmation(activeSentinels, 5_000);
 
-      // Get ack first
-      const ack = await waitAck(3_000);
-      if (!ack.ok) {
-        // Subscription was rejected
-        steps.push({ n, strategy: "unsub-resub", result: "fail", ackMs: ack.ms, note: ack.note });
-        log(emit, "error", `  N=${n} unsub+resub: ✗ ack failed — ${ack.note ?? "no ack"}`);
-        errors.push(`${label}: subscription rejected at N=${n} (${ack.note ?? "no ack"})`);
+      steps.push({ n, strategy: "unsub-resub", result: c.result, ackMs: c.ackMs, tradeMs: c.tradeMs, note: c.note });
+      const icon = c.result === "ok" ? "✓" : c.result === "ack-no-trade" ? "⚠" : "✗";
+      log(emit, c.result === "ok" ? "success" : c.result === "ack-no-trade" ? "warn" : "error",
+        `  N=${n} unsub+resub: ${icon} ${c.result}${c.ackMs !== undefined ? ` ack=${c.ackMs}ms` : ""}${c.tradeMs !== undefined ? ` trade=${c.tradeMs}ms` : ""}${c.note ? ` (${c.note})` : ""}`
+      );
+
+      if (c.result === "fail") {
+        // Explicit PumpPortal rejection or no ack — stop the ramp
+        errors.push(`${label}: subscription failed at N=${n} (${c.note ?? "unknown"})`);
         break;
-      }
-
-      // If we have active sentinels in this batch, wait for a trade event (true confirmation)
-      let tradeResult: { ok: boolean; ms: number; note?: string } | null = null;
-      if (activeSentinels.length > 0) {
-        tradeResult = await waitTrade(activeSentinels, 5_000);
-      }
-
-      if (tradeResult && tradeResult.ok) {
-        steps.push({ n, strategy: "unsub-resub", result: "ok", ackMs: ack.ms, tradeMs: tradeResult.ms });
-        log(emit, "success", `  N=${n} unsub+resub: ✓ ack ${ack.ms}ms, trade ${tradeResult.ms}ms`);
-      } else if (tradeResult && !tradeResult.ok) {
-        // Ack received but no trade event — subscription was acknowledged but delivery unconfirmed
-        steps.push({ n, strategy: "unsub-resub", result: "ack-no-trade", ackMs: ack.ms, note: tradeResult.note });
-        log(emit, "warn", `  N=${n} unsub+resub: ⚠ ack ${ack.ms}ms, ${tradeResult.note}`);
-      } else {
-        // No sentinels in batch — can only confirm via ack
-        steps.push({ n, strategy: "unsub-resub", result: "ack-no-trade", ackMs: ack.ms, note: "no sentinel in batch" });
-        log(emit, "success", `  N=${n} unsub+resub: ✓ ack ${ack.ms}ms (no sentinel in batch)`);
       }
 
       prevN = n;
@@ -557,13 +559,22 @@ async function stage4BatchCapacity(
 
     try { ws.close(); } catch { /* ignore */ }
 
-    const maxTradeConfirmed = steps.filter((s) => s.strategy === "unsub-resub" && s.result === "ok").map((s) => s.n);
-    const maxAckConfirmed = steps.filter((s) => s.strategy === "unsub-resub" && (s.result === "ok" || s.result === "ack-no-trade")).map((s) => s.n);
-    const max = maxTradeConfirmed.length ? Math.max(...maxTradeConfirmed) : 0;
+    const maxTradeConfirmed = steps
+      .filter((s) => s.strategy === "unsub-resub" && s.result === "ok")
+      .map((s) => s.n);
+    const maxAckConfirmed = steps
+      .filter((s) => s.strategy === "unsub-resub" && (s.result === "ok" || s.result === "ack-no-trade"))
+      .map((s) => s.n);
+    const maxTrade = maxTradeConfirmed.length ? Math.max(...maxTradeConfirmed) : 0;
     const maxAck = maxAckConfirmed.length ? Math.max(...maxAckConfirmed) : 0;
     const failPoints = steps.filter((s) => s.result === "fail").map((s) => s.n);
 
-    log(emit, "success", `  ▶ Max trade-confirmed: ${max} keys | Max ack-confirmed: ${maxAck} keys${failPoints.length ? ` | First fail: N=${failPoints[0]}` : ""}`);
+    log(
+      emit,
+      maxTrade > 0 || maxAck > 0 ? "success" : "warn",
+      `  ▶ Max trade-confirmed: ${maxTrade} keys | Max ack-confirmed: ${maxAck} keys` +
+        (failPoints.length ? ` | First fail: N=${failPoints[0]}` : " | No failure detected")
+    );
 
     return steps;
   };
