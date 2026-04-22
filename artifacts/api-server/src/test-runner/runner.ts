@@ -31,9 +31,21 @@ function log(emit: EmitFn, level: string, message: string): void {
 const PUMPPORTAL_WS = () =>
   process.env.PUMPPORTAL_WS_URL ?? "wss://pumpportal.fun/api/data";
 
+const PUMPDEV_WS = () =>
+  process.env.PUMPDEV_WS_URL ?? "wss://pumpdev.io/ws";
+
 function openWs(): Promise<WebSocket> {
   return new Promise<WebSocket>((resolve, reject) => {
     const ws = new WebSocket(PUMPPORTAL_WS());
+    const t = setTimeout(() => reject(new Error("WS connect timeout")), 10_000);
+    ws.once("open", () => { clearTimeout(t); resolve(ws); });
+    ws.once("error", (e) => { clearTimeout(t); reject(e); });
+  });
+}
+
+function openWsDev(): Promise<WebSocket> {
+  return new Promise<WebSocket>((resolve, reject) => {
+    const ws = new WebSocket(PUMPDEV_WS());
     const t = setTimeout(() => reject(new Error("WS connect timeout")), 10_000);
     ws.once("open", () => { clearTimeout(t); resolve(ws); });
     ws.once("error", (e) => { clearTimeout(t); reject(e); });
@@ -61,51 +73,104 @@ async function stage1MintCollection(
   emit: EmitFn,
   results: StageResult[]
 ): Promise<string[]> {
-  const stageName = "Stage 1: Mint Collection (subscribeNewToken)";
+  const stageName = "Stage 1: Mint Collection (subscribeNewToken from PumpPortal + PumpDev)";
   emit({ type: "stage-start", stage: 1, name: stageName });
   log(emit, "header", "════ " + stageName);
 
-  const COLLECT_TARGET = 30;
-  const TIMEOUT_MS = 20_000;
+  const COLLECT_TARGET = 2000;
+  const TIMEOUT_MS = 300_000;
+  const PROGRESS_LOG_INTERVAL = 200;
   const stageStart = Date.now();
-  const mints: string[] = [];
+  const mintSet = new Set<string>();
   const errors: string[] = [];
   let success = false;
+  let ppConnected = false;
+  let pdConnected = false;
 
   try {
-    log(emit, "info", `Connecting to PumpPortal (${PUMPPORTAL_WS()})...`);
-    const ws = await openWs();
-    log(emit, "success", "✓ PumpPortal WebSocket connected");
+    log(emit, "info", `Attempting dual-source collection (target: ${COLLECT_TARGET} mints in ${TIMEOUT_MS / 1000}s)...`);
 
-    await new Promise<void>((resolve) => {
-      const t = setTimeout(() => { ws.close(); }, TIMEOUT_MS);
-      ws.send(JSON.stringify({ method: "subscribeNewToken" }));
-      log(emit, "info", "Subscribed to subscribeNewToken");
+    // Open both connections in parallel
+    const ppPromise = openWs()
+      .then((ws) => { ppConnected = true; log(emit, "success", "✓ PumpPortal WebSocket connected"); return ws; })
+      .catch((e) => { log(emit, "warn", `PumpPortal connection failed: ${(e as Error).message}`); return null; });
 
-      ws.on("message", (data) => {
+    const pdPromise = openWsDev()
+      .then((ws) => { pdConnected = true; log(emit, "success", "✓ PumpDev WebSocket connected"); return ws; })
+      .catch((e) => { log(emit, "warn", `PumpDev connection failed: ${(e as Error).message}`); return null; });
+
+    const [ppWs, pdWs] = await Promise.all([ppPromise, pdPromise]);
+
+    if (!ppWs && !pdWs) {
+      errors.push("Neither PumpPortal nor PumpDev could connect");
+      log(emit, "error", "✗ All connection attempts failed");
+    } else {
+      const timeout = setTimeout(() => {
+        if (ppWs) ppWs.close();
+        if (pdWs) pdWs.close();
+      }, TIMEOUT_MS);
+
+      // Subscribe to both
+      if (ppWs) {
+        ppWs.send(JSON.stringify({ method: "subscribeNewToken" }));
+      }
+      if (pdWs) {
+        pdWs.send(JSON.stringify({ method: "subscribeNewToken" }));
+      }
+
+      // Set up message handlers for both
+      const messageHandler = (source: string) => (data: unknown) => {
         try {
           const msg = JSON.parse(data.toString()) as Record<string, unknown>;
-          if (typeof msg.mint === "string" && !mints.includes(msg.mint)) {
-            mints.push(msg.mint);
-            if (mints.length === 1)
-              log(emit, "info", `First mint: ${msg.mint.slice(0, 20)}...`);
-            if (mints.length >= COLLECT_TARGET) {
-              clearTimeout(t);
-              ws.close();
+          if (typeof msg.mint === "string" && !mintSet.has(msg.mint)) {
+            mintSet.add(msg.mint);
+            if (mintSet.size === 1) {
+              log(emit, "info", `First mint (${source}): ${msg.mint.slice(0, 20)}...`);
+            }
+            if (mintSet.size % PROGRESS_LOG_INTERVAL === 0) {
+              log(emit, "info", `Progress: ${mintSet.size}/${COLLECT_TARGET} mints collected...`);
+            }
+            if (mintSet.size >= COLLECT_TARGET) {
+              clearTimeout(timeout);
+              if (ppWs) ppWs.close();
+              if (pdWs) pdWs.close();
             }
           }
-          if (msg.errors) log(emit, "warn", `PumpPortal: ${JSON.stringify(msg.errors)}`);
+          if (msg.errors) log(emit, "warn", `${source}: ${JSON.stringify(msg.errors)}`);
         } catch { /* skip */ }
-      });
-      ws.on("close", () => { clearTimeout(t); resolve(); });
-      ws.on("error", () => { clearTimeout(t); resolve(); });
-    });
+      };
 
-    if (mints.length === 0) {
-      errors.push(`PumpPortal returned 0 new token events within ${TIMEOUT_MS / 1000}s`);
+      if (ppWs) {
+        ppWs.on("message", messageHandler("PumpPortal"));
+        ppWs.on("close", () => { clearTimeout(timeout); });
+        ppWs.on("error", () => { clearTimeout(timeout); });
+      }
+
+      if (pdWs) {
+        pdWs.on("message", messageHandler("PumpDev"));
+        pdWs.on("close", () => { clearTimeout(timeout); });
+        pdWs.on("error", () => { clearTimeout(timeout); });
+      }
+
+      // Wait for completion
+      await new Promise<void>((resolve) => {
+        const checkInterval = setInterval(() => {
+          if (!ppWs || ppWs.readyState === 3) { // CLOSED = 3
+            if (!pdWs || pdWs.readyState === 3) {
+              clearInterval(checkInterval);
+              clearTimeout(timeout);
+              resolve();
+            }
+          }
+        }, 100);
+      });
+    }
+
+    if (mintSet.size === 0) {
+      errors.push(`No mints collected within ${TIMEOUT_MS / 1000}s from either source`);
       log(emit, "error", "✗ No mints received — Stage 1 failed");
     } else {
-      log(emit, "success", `✓ Collected ${mints.length} mints`);
+      log(emit, "success", `✓ Collected ${mintSet.size} mints from ${ppConnected ? "PumpPortal" : ""}${ppConnected && pdConnected ? " + " : ""}${pdConnected ? "PumpDev" : ""}`);
       success = true;
     }
   } catch (e) {
@@ -114,8 +179,8 @@ async function stage1MintCollection(
   }
 
   const duration = Date.now() - stageStart;
-  stageEnd(emit, results, 1, stageName, success, duration, { mintsCollected: mints.length }, errors);
-  return mints;
+  stageEnd(emit, results, 1, stageName, success, duration, { mintsCollected: mintSet.size, pumpportalConnected: ppConnected, pumpdevConnected: pdConnected }, errors);
+  return Array.from(mintSet);
 }
 
 // ─── Stage 2: Trade Wallet Collection ─────────────────────────────────────
@@ -125,51 +190,110 @@ async function stage2TradeWallets(
   results: StageResult[],
   mints: string[]
 ): Promise<string[]> {
-  const stageName = "Stage 2: Trade Wallet Collection (subscribeTokenTrade)";
+  const stageName = "Stage 2: Trade Wallet Collection (subscribeTokenTrade from PumpPortal + PumpDev)";
   emit({ type: "stage-start", stage: 2, name: stageName });
   log(emit, "header", "════ " + stageName);
 
-  const TIMEOUT_MS = 20_000;
+  const COLLECT_TARGET = 2000;
+  const TIMEOUT_MS = 300_000;
+  const PROGRESS_LOG_INTERVAL = 200;
   const stageStart = Date.now();
-  const wallets: string[] = [];
+  const walletSet = new Set<string>();
   const errors: string[] = [];
   let success = false;
+  let ppConnected = false;
+  let pdConnected = false;
 
-  // ── PumpPortal trade subscription ──
+  // ── Dual-source trade wallet subscription ──
   try {
-    log(emit, "info", `Subscribing to trades for ${mints.length} mints...`);
-    const ws = await openWs();
-    log(emit, "success", "✓ PumpPortal WebSocket connected");
+    log(emit, "info", `Subscribing to trades for ${mints.length} mints from dual sources (target: ${COLLECT_TARGET} wallets)...`);
 
-    await new Promise<void>((resolve) => {
-      const t = setTimeout(() => ws.close(), TIMEOUT_MS);
-      ws.send(JSON.stringify({ method: "subscribeTokenTrade", keys: mints }));
+    // Open both connections in parallel
+    const ppPromise = openWs()
+      .then((ws) => { ppConnected = true; log(emit, "success", "✓ PumpPortal WebSocket connected"); return ws; })
+      .catch((e) => { log(emit, "warn", `PumpPortal connection failed: ${(e as Error).message}`); return null; });
 
-      ws.on("message", (data) => {
+    const pdPromise = openWsDev()
+      .then((ws) => { pdConnected = true; log(emit, "success", "✓ PumpDev WebSocket connected"); return ws; })
+      .catch((e) => { log(emit, "warn", `PumpDev connection failed: ${(e as Error).message}`); return null; });
+
+    const [ppWs, pdWs] = await Promise.all([ppPromise, pdPromise]);
+
+    if (!ppWs && !pdWs) {
+      errors.push("Neither PumpPortal nor PumpDev could connect");
+      log(emit, "error", "✗ All connection attempts failed");
+    } else {
+      const timeout = setTimeout(() => {
+        if (ppWs) ppWs.close();
+        if (pdWs) pdWs.close();
+      }, TIMEOUT_MS);
+
+      // Subscribe to both
+      if (ppWs) {
+        ppWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: mints }));
+      }
+      if (pdWs) {
+        pdWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: mints }));
+      }
+
+      // Set up message handlers for both
+      const messageHandler = (source: string) => (data: unknown) => {
         try {
           const msg = JSON.parse(data.toString()) as Record<string, unknown>;
-          if (msg.message) log(emit, "info", `PumpPortal: ${msg.message}`);
-          if (typeof msg.traderPublicKey === "string" && !wallets.includes(msg.traderPublicKey)) {
-            wallets.push(msg.traderPublicKey);
-            if (wallets.length === 1)
-              log(emit, "info", `First trader wallet: ${msg.traderPublicKey.slice(0, 20)}...`);
+          if (msg.message) log(emit, "info", `${source}: ${msg.message}`);
+          if (typeof msg.traderPublicKey === "string" && !walletSet.has(msg.traderPublicKey)) {
+            walletSet.add(msg.traderPublicKey);
+            if (walletSet.size === 1) {
+              log(emit, "info", `First trader wallet (${source}): ${msg.traderPublicKey.slice(0, 20)}...`);
+            }
+            if (walletSet.size % PROGRESS_LOG_INTERVAL === 0) {
+              log(emit, "info", `Progress: ${walletSet.size}/${COLLECT_TARGET} wallets collected...`);
+            }
+            if (walletSet.size >= COLLECT_TARGET) {
+              clearTimeout(timeout);
+              if (ppWs) ppWs.close();
+              if (pdWs) pdWs.close();
+            }
           }
-          if (msg.errors) log(emit, "warn", `PumpPortal: ${JSON.stringify(msg.errors)}`);
+          if (msg.errors) log(emit, "warn", `${source}: ${JSON.stringify(msg.errors)}`);
         } catch { /* skip */ }
-      });
-      ws.on("close", () => { clearTimeout(t); resolve(); });
-      ws.on("error", () => { clearTimeout(t); resolve(); });
-    });
+      };
 
-    if (wallets.length === 0) {
+      if (ppWs) {
+        ppWs.on("message", messageHandler("PumpPortal"));
+        ppWs.on("close", () => { clearTimeout(timeout); });
+        ppWs.on("error", () => { clearTimeout(timeout); });
+      }
+
+      if (pdWs) {
+        pdWs.on("message", messageHandler("PumpDev"));
+        pdWs.on("close", () => { clearTimeout(timeout); });
+        pdWs.on("error", () => { clearTimeout(timeout); });
+      }
+
+      // Wait for completion
+      await new Promise<void>((resolve) => {
+        const checkInterval = setInterval(() => {
+          if (!ppWs || ppWs.readyState === 3) { // CLOSED = 3
+            if (!pdWs || pdWs.readyState === 3) {
+              clearInterval(checkInterval);
+              clearTimeout(timeout);
+              resolve();
+            }
+          }
+        }, 100);
+      });
+    }
+
+    if (walletSet.size === 0) {
       errors.push(`No trade events in ${TIMEOUT_MS / 1000}s — no trader wallets collected`);
       log(emit, "error", "✗ No trade events received — Stage 2 failed");
     } else {
-      log(emit, "success", `✓ Collected ${wallets.length} real trader wallets`);
+      log(emit, "success", `✓ Collected ${walletSet.size} real trader wallets from ${ppConnected ? "PumpPortal" : ""}${ppConnected && pdConnected ? " + " : ""}${pdConnected ? "PumpDev" : ""}`);
     }
   } catch (e) {
     errors.push((e as Error).message);
-    log(emit, "error", `Stage 2 PumpPortal error: ${(e as Error).message}`);
+    log(emit, "error", `Stage 2 error: ${(e as Error).message}`);
   }
 
   // ── DexScreener health check ──
@@ -209,10 +333,10 @@ async function stage2TradeWallets(
     log(emit, "warn", `DexPaprika streaming unreachable: ${(e as Error).message}`);
   }
 
-  success = wallets.length > 0 && errors.length === 0;
+  success = walletSet.size > 0 && errors.length === 0;
   const duration = Date.now() - stageStart;
-  stageEnd(emit, results, 2, stageName, success, duration, { walletsCollected: wallets.length, mintsSubscribed: mints.length }, errors);
-  return wallets;
+  stageEnd(emit, results, 2, stageName, success, duration, { walletsCollected: walletSet.size, mintsSubscribed: mints.length, pumpportalConnected: ppConnected, pumpdevConnected: pdConnected }, errors);
+  return Array.from(walletSet);
 }
 
 // ─── Stage 3: Chainstack + Shyft Wallet History ────────────────────────────
