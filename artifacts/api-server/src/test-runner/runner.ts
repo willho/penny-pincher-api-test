@@ -739,7 +739,7 @@ async function stage5DexPaprika(
     }
   } catch (e) {
     const msg = (e as Error).message;
-    if (!msg.includes("abort") && !msg.includes("timeout")) {
+    if (!msg.includes("abort") && !msg.includes("timeout") && !msg.includes("terminated") && !msg.includes("cancel")) {
       errors.push(`DexPaprika stream error: ${msg}`);
       log(emit, "error", `✗ ${msg}`);
     }
@@ -1126,7 +1126,7 @@ async function stage7DexPaprikaStress(
     }
   } catch (e) {
     const msg = (e as Error).message;
-    if (!msg.includes("abort") && !msg.includes("timeout")) {
+    if (!msg.includes("abort") && !msg.includes("timeout") && !msg.includes("terminated") && !msg.includes("cancel")) {
       errors.push(`DexPaprika stream error: ${msg}`);
       log(emit, "error", `✗ Stream error: ${msg}`);
     }
