@@ -663,7 +663,6 @@ async function stage5DexPaprika(
     const connectController = new AbortController();
     const connectTimer = setTimeout(() => connectController.abort(), 8_000);
     const t0 = Date.now();
-
     const resp = await fetch("https://streaming.dexpaprika.com/stream", {
       method: "POST",
       headers: {

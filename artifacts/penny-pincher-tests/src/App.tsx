@@ -126,11 +126,20 @@ function Stage4Details({ details }: { details: Record<string, unknown> }) {
 }
 
 function Stage5Details({ details }: { details: Record<string, unknown> }) {
+  const sample = details.topTokenSample as string[] | undefined;
   return (
     <div className="mt-2 space-y-0.5 text-xs text-gray-400">
-      <div>HTTP: {details.httpStatus as number ?? "—"} · Mints: {details.mintsProvided as number ?? "—"}</div>
-      <div>Events received: <span className={`font-semibold ${(details.eventsReceived as number) > 0 ? "text-green-400" : "text-yellow-400"}`}>{details.eventsReceived as number ?? 0}</span></div>
-      {details.firstEventMs !== undefined && <div>First event: {details.firstEventMs as number}ms</div>}
+      <div>
+        Health: <span className={(details.healthOk as boolean) ? "text-green-400" : "text-red-400"}>{(details.healthOk as boolean) ? "✓ up" : "✗ unreachable"}</span>
+        {" · "}Top tokens HTTP: {details.topTokensHttpStatus as number ?? "—"}
+      </div>
+      <div>
+        Top Solana tokens: <span className={`font-semibold ${(details.topTokenCount as number) > 0 ? "text-green-400" : "text-yellow-400"}`}>{details.topTokenCount as number ?? 0}</span>
+      </div>
+      {sample && sample.length > 0 && <div className="truncate">Sample: {sample.join(", ")}</div>}
+      <div>
+        Bonding mints queried: {details.bondingMintsQueried as number ?? 0} · Found on DexPaprika: {details.bondingMintsFoundOnDexPaprika as number ?? 0}
+      </div>
       {details.note && <div className="text-yellow-400">{details.note as string}</div>}
     </div>
   );
