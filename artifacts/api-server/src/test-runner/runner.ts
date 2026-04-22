@@ -659,8 +659,9 @@ async function stage5DexPaprika(
   const latencies: number[] = [];
 
   try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 20_000);
+    // Phase 1: connect (8s timeout)
+    const connectController = new AbortController();
+    const connectTimer = setTimeout(() => connectController.abort(), 8_000);
     const t0 = Date.now();
 
     const resp = await fetch("https://streaming.dexpaprika.com/stream", {
@@ -670,8 +671,8 @@ async function stage5DexPaprika(
         "Content-Type": "application/json",
       },
       body: JSON.stringify(assets),
-      signal: controller.signal,
-    });
+      signal: connectController.signal,
+    }).finally(() => clearTimeout(connectTimer));
 
     httpStatus = resp.status;
 
@@ -685,7 +686,6 @@ async function stage5DexPaprika(
         mintsProvided: testMints.length,
         eventsReceived: 0,
       }, errors);
-      clearTimeout(timeoutId);
       return;
     }
 
@@ -693,13 +693,16 @@ async function stage5DexPaprika(
     log(emit, "success", `✓ DexPaprika streaming connected (HTTP 200, ${Date.now() - t0}ms)`);
     log(emit, "info", "Reading price stream for 15s...");
 
+    // Phase 2: read for exactly 15s
+    const readController = new AbortController();
+    const readTimer = setTimeout(() => readController.abort(), 15_000);
     const reader = resp.body!.getReader();
     const decoder = new TextDecoder();
     let buf = "";
 
     try {
       while (true) {
-        if (controller.signal.aborted) break;
+        if (readController.signal.aborted) break;
         const { done, value } = await reader.read();
         if (done) break;
 
@@ -731,7 +734,7 @@ async function stage5DexPaprika(
         }
       }
     } finally {
-      clearTimeout(timeoutId);
+      clearTimeout(readTimer);
       reader.cancel().catch(() => { /* ignore */ });
     }
   } catch (e) {
@@ -1045,15 +1048,16 @@ async function stage7DexPaprikaStress(
   const t0 = Date.now();
 
   try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 35_000);
+    // Phase 1: connect (10s timeout)
+    const connectController = new AbortController();
+    const connectTimer = setTimeout(() => connectController.abort(), 10_000);
 
     const resp = await fetch("https://streaming.dexpaprika.com/stream", {
       method: "POST",
       headers: { Accept: "text/event-stream", "Content-Type": "application/json" },
       body: JSON.stringify(assets),
-      signal: controller.signal,
-    });
+      signal: connectController.signal,
+    }).finally(() => clearTimeout(connectTimer));
 
     httpStatus = resp.status;
 
@@ -1066,7 +1070,6 @@ async function stage7DexPaprikaStress(
         httpStatus, tokensSubscribed: allTokens.length,
         bondingCurveTokens: bondingMints.length, graduatedTokens: graduatedMints.length, totalEvents: 0,
       }, errors);
-      clearTimeout(timeoutId);
       return;
     }
 
@@ -1074,7 +1077,10 @@ async function stage7DexPaprikaStress(
     log(emit, "success", `✓ DexPaprika accepted ${allTokens.length} subscriptions (HTTP 200, ${Date.now() - t0}ms)`);
     log(emit, "info", "Reading stream for 30s...");
 
-    // ── Step 3: Read SSE for 30s ──
+    // Phase 2: read for exactly 30s
+    const readController = new AbortController();
+    const readTimer = setTimeout(() => readController.abort(), 30_000);
+    const readStart = Date.now();
     const reader = resp.body!.getReader();
     const decoder = new TextDecoder();
     let buf = "";
@@ -1082,7 +1088,7 @@ async function stage7DexPaprikaStress(
 
     try {
       while (true) {
-        if (controller.signal.aborted) break;
+        if (readController.signal.aborted) break;
         const { done, value } = await reader.read();
         if (done) break;
 
@@ -1108,13 +1114,14 @@ async function stage7DexPaprikaStress(
         }
 
         if (Date.now() - lastLogAt >= 5_000) {
-          const evps = (totalEvents / ((Date.now() - t0) / 1000)).toFixed(1);
+          const elapsed = (Date.now() - readStart) / 1000;
+          const evps = elapsed > 0 ? (totalEvents / elapsed).toFixed(1) : "0";
           log(emit, "info", `  ${totalEvents} events, ${tokenUpdateCounts.size} tokens priced, ${evps} ev/s`);
           lastLogAt = Date.now();
         }
       }
     } finally {
-      clearTimeout(timeoutId);
+      clearTimeout(readTimer);
       reader.cancel().catch(() => { /* ignore */ });
     }
   } catch (e) {
@@ -1125,7 +1132,8 @@ async function stage7DexPaprikaStress(
     }
   }
 
-  const eventsPerSec = (totalEvents / 30).toFixed(1);
+  const actualReadSecs = Math.min(30, (Date.now() - t0) / 1000);
+  const eventsPerSec = actualReadSecs > 0 ? (totalEvents / actualReadSecs).toFixed(1) : "0";
   const coveragePct = allTokens.length > 0
     ? ((tokenUpdateCounts.size / allTokens.length) * 100).toFixed(1)
     : "0";
