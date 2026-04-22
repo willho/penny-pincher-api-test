@@ -2,27 +2,24 @@
   "name": "penny-pincher-api-test",
   "version": "1.0.0",
   "description": "API format validation and syntax testing for Penny-Pincher2 integration",
-  "main": "dist/index.js",
+  "main": "dist/server.js",
   "scripts": {
     "build": "tsc",
-    "test:all": "node dist/tests/test-all-stages.js",
-    "test:syntax": "node dist/tests/test-syntax-per-api.js",
-    "test:rate-limits": "node dist/tests/test-rate-limits.js",
-    "dev": "ts-node src/tests/test-all-stages.ts"
+    "start": "node dist/server.js",
+    "dev:server": "ts-node src/server.ts",
+    "test:all": "ts-node src/tests/test-all-stages.ts",
+    "test:syntax": "ts-node src/tests/test-syntax-per-api.ts"
   },
-  "keywords": [
-    "penny-pincher",
-    "api-testing",
-    "solana",
-    "dexes"
-  ],
+  "keywords": ["penny-pincher", "api-testing", "solana", "dexes"],
   "author": "willho",
   "license": "MIT",
   "dependencies": {
     "dotenv": "^16.0.3",
+    "express": "^4.18.2",
     "ws": "^8.13.0"
   },
   "devDependencies": {
+    "@types/express": "^4.17.21",
     "@types/node": "^20.0.0",
     "@types/ws": "^8.5.0",
     "typescript": "^5.0.0",
