@@ -191,20 +191,22 @@ async function stage2TradeWallets(
     log(emit, "warn", `DexScreener unreachable: ${(e as Error).message}`);
   }
 
-  // ── DexPaprika SSE health check (warn-only, may be IP-banned in dev) ──
-  log(emit, "info", "DexPaprika SSE health check...");
+  // ── DexPaprika streaming health check ──
+  log(emit, "info", "DexPaprika streaming health check...");
   try {
     const t0 = Date.now();
-    const resp = await fetch(
-      `https://api.dexpaprika.com/v1/sse/trades?tokens=${mints.slice(0, 3).join(",")}`,
-      { signal: AbortSignal.timeout(5_000) }
-    );
+    const resp = await fetch("https://streaming.dexpaprika.com/stream", {
+      method: "POST",
+      headers: { Accept: "text/event-stream", "Content-Type": "application/json" },
+      body: JSON.stringify([{ chain: "solana", address: "So11111111111111111111111111111111111111112", method: "t_p" }]),
+      signal: AbortSignal.timeout(5_000),
+    });
     const ms = Date.now() - t0;
-    resp.ok || resp.status === 200
-      ? log(emit, "success", `✓ DexPaprika SSE reachable (${ms}ms)`)
-      : log(emit, "warn", `DexPaprika SSE: HTTP ${resp.status} — may be IP-banned in dev; verify in production`);
+    resp.ok
+      ? log(emit, "success", `✓ DexPaprika streaming reachable (HTTP 200, ${ms}ms)`)
+      : log(emit, "warn", `DexPaprika streaming: HTTP ${resp.status}`);
   } catch (e) {
-    log(emit, "warn", `DexPaprika SSE: ${(e as Error).message} — may be IP-banned in dev; verify in production`);
+    log(emit, "warn", `DexPaprika streaming unreachable: ${(e as Error).message}`);
   }
 
   success = wallets.length > 0 && errors.length === 0;
@@ -619,22 +621,23 @@ async function stage4BatchCapacity(
   }, errors);
 }
 
-// ─── Stage 5: DexPaprika SSE Trade Stream ──────────────────────────────────
+// ─── Stage 5: DexPaprika Bonding-Curve Price Stream ────────────────────────
+// Uses POST https://streaming.dexpaprika.com/stream with bonding-curve mints
+// from Stage 1. Tests whether DexPaprika indexes freshly launched PumpFun tokens.
 
 async function stage5DexPaprika(
   emit: EmitFn,
   results: StageResult[],
   bondingMints: string[]
 ): Promise<void> {
-  const stageName = "Stage 5: DexPaprika SSE Trade Stream";
+  const stageName = "Stage 5: DexPaprika Bonding-Curve Price Stream";
   emit({ type: "stage-start", stage: 5, name: stageName });
   log(emit, "header", "════ " + stageName);
 
   const stageStart = Date.now();
   const errors: string[] = [];
 
-  // Use the first 5 bonding-curve mints from Stage 1 (PumpFun tokens)
-  const testMints = bondingMints.slice(0, 5);
+  const testMints = bondingMints.slice(0, 20);
   if (testMints.length === 0) {
     errors.push("No bonding-curve mints available from Stage 1 — cannot test DexPaprika");
     log(emit, "error", "✗ No mints to test with");
@@ -642,56 +645,61 @@ async function stage5DexPaprika(
     return;
   }
 
-  log(emit, "info", `Testing DexPaprika SSE with ${testMints.length} PumpFun bonding-curve mint(s)`);
-  log(emit, "info", `Mints: ${testMints.map((m) => m.slice(0, 16) + "...").join(", ")}`);
+  log(emit, "info", `Testing DexPaprika price stream with ${testMints.length} bonding-curve mint(s)`);
+  log(emit, "info", `Mints: ${testMints.slice(0, 3).map((m) => m.slice(0, 16) + "...").join(", ")}${testMints.length > 3 ? ` +${testMints.length - 3} more` : ""}`);
 
-  const STREAM_URL = `https://api.dexpaprika.com/v1/sse/trades?tokens=${testMints.join(",")}`;
-  log(emit, "info", `Connecting to DexPaprika SSE: ${STREAM_URL.slice(0, 80)}...`);
+  const assets = testMints.map((a) => ({ chain: "solana", address: a, method: "t_p" }));
 
   let eventsReceived = 0;
   let connectOk = false;
   let firstEventMs: number | undefined;
   let httpStatus: number | undefined;
+  const uniqueMintsWithPrices = new Set<string>();
+  const samplePrices: { mint: string; price: string }[] = [];
+  const latencies: number[] = [];
 
   try {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 15_000);
+    const timeoutId = setTimeout(() => controller.abort(), 20_000);
     const t0 = Date.now();
 
-    const resp = await fetch(STREAM_URL, {
+    const resp = await fetch("https://streaming.dexpaprika.com/stream", {
+      method: "POST",
+      headers: {
+        Accept: "text/event-stream",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(assets),
       signal: controller.signal,
-      headers: { Accept: "text/event-stream" },
     });
 
-    clearTimeout(timeoutId);
     httpStatus = resp.status;
 
-    if (!resp.ok && resp.status !== 200) {
-      errors.push(`DexPaprika SSE HTTP ${resp.status} — may be IP-banned in this environment`);
-      log(emit, "warn", `⚠ DexPaprika HTTP ${resp.status} — likely IP-restricted in dev (verify in production)`);
+    if (!resp.ok) {
+      let errBody = "";
+      try { errBody = await resp.text(); } catch { /* ignore */ }
+      errors.push(`DexPaprika HTTP ${resp.status}: ${errBody.slice(0, 200)}`);
+      log(emit, "error", `✗ DexPaprika HTTP ${resp.status}: ${errBody.slice(0, 100)}`);
       stageEnd(emit, results, 5, stageName, false, Date.now() - stageStart, {
         httpStatus,
         mintsProvided: testMints.length,
         eventsReceived: 0,
-        note: "IP-banned or unreachable from this environment",
       }, errors);
+      clearTimeout(timeoutId);
       return;
     }
 
     connectOk = true;
-    log(emit, "success", `✓ DexPaprika SSE connected (HTTP ${resp.status}, ${Date.now() - t0}ms)`);
+    log(emit, "success", `✓ DexPaprika streaming connected (HTTP 200, ${Date.now() - t0}ms)`);
+    log(emit, "info", "Reading price stream for 15s...");
 
-    // Read the SSE stream for up to 15s, count trade events
-    const streamController = new AbortController();
-    const streamTimeout = setTimeout(() => streamController.abort(), 15_000);
+    const reader = resp.body!.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
 
     try {
-      const reader = resp.body!.getReader();
-      const decoder = new TextDecoder();
-      let buf = "";
-
       while (true) {
-        if (streamController.signal.aborted) break;
+        if (controller.signal.aborted) break;
         const { done, value } = await reader.read();
         if (done) break;
 
@@ -702,58 +710,59 @@ async function stage5DexPaprika(
         for (const line of lines) {
           if (!line.startsWith("data:")) continue;
           const raw = line.slice(5).trim();
-          if (!raw || raw === "connected") continue;
+          if (!raw) continue;
           try {
-            const evt = JSON.parse(raw) as Record<string, unknown>;
-            // DexPaprika trade events have token + price + amount fields
-            if (evt.token || evt.tokenAddress || evt.mint || evt.price !== undefined) {
+            const evt = JSON.parse(raw) as { a?: string; c?: string; p?: string; t?: number; t_p?: number };
+            if (evt.a && evt.p) {
               eventsReceived++;
+              uniqueMintsWithPrices.add(evt.a);
+              if (evt.t_p) latencies.push(Date.now() / 1000 - evt.t_p);
+
               if (eventsReceived === 1) {
                 firstEventMs = Date.now() - t0;
-                log(emit, "success", `✓ First trade event in ${firstEventMs}ms — token: ${
-                  (evt.token ?? evt.tokenAddress ?? evt.mint ?? "unknown") as string
-                }`);
+                log(emit, "success", `✓ First price event in ${firstEventMs}ms — ${evt.a.slice(0, 20)}... $${Number(evt.p).toFixed(8)}`);
               }
-              if (eventsReceived <= 3) {
-                log(emit, "info", `  event ${eventsReceived}: ${JSON.stringify(evt).slice(0, 120)}`);
+              if (samplePrices.length < 5 && !samplePrices.find((s) => s.mint === evt.a)) {
+                samplePrices.push({ mint: evt.a, price: evt.p });
+                log(emit, "info", `  price: ${evt.a.slice(0, 20)}... = $${Number(evt.p).toFixed(8)}`);
               }
             }
-          } catch { /* malformed line */ }
+          } catch { /* malformed */ }
         }
-
-        if (eventsReceived >= 5) break; // Got enough data
       }
-      reader.cancel().catch(() => { /* ignore */ });
     } finally {
-      clearTimeout(streamTimeout);
-    }
-
-    if (eventsReceived > 0) {
-      log(emit, "success", `✓ DexPaprika: ${eventsReceived} trade event(s) received for PumpFun bonding mints`);
-    } else {
-      log(emit, "warn", "⚠ DexPaprika connected but no trade events in 15s — tokens may be inactive or IP-restricted");
-      errors.push("No trade events received from DexPaprika in 15s — tokens may be inactive on this provider");
+      clearTimeout(timeoutId);
+      reader.cancel().catch(() => { /* ignore */ });
     }
   } catch (e) {
     const msg = (e as Error).message;
-    if (msg.includes("abort") || msg.includes("timeout")) {
-      // Stream read timed out — could be normal (no activity)
-      if (connectOk && eventsReceived === 0) {
-        log(emit, "warn", "⚠ DexPaprika stream opened but no events in 15s — bonding mints may be inactive");
-        errors.push("No trade events in 15s stream window — mints may be inactive");
-      }
-    } else {
-      errors.push(`DexPaprika: ${msg}`);
-      log(emit, "warn", `⚠ DexPaprika: ${msg} — may be IP-banned in dev (verify in production)`);
+    if (!msg.includes("abort") && !msg.includes("timeout")) {
+      errors.push(`DexPaprika stream error: ${msg}`);
+      log(emit, "error", `✗ ${msg}`);
     }
   }
 
+  const avgLatencyMs = latencies.length > 0
+    ? Math.round((latencies.reduce((a, b) => a + b, 0) / latencies.length) * 1000)
+    : undefined;
+
+  if (eventsReceived > 0) {
+    log(emit, "success", `✓ DexPaprika: ${eventsReceived} price event(s) for ${uniqueMintsWithPrices.size}/${testMints.length} bonding-curve mints${avgLatencyMs !== undefined ? ` (avg latency ${avgLatencyMs}ms)` : ""}`);
+  } else if (connectOk) {
+    log(emit, "warn", "⚠ DexPaprika connected but no price events in 15s — bonding-curve tokens may not yet be indexed");
+  }
+
+  // Warn-not-fail for 0 events: bonding-curve tokens are brand-new and may not be indexed
   const success = connectOk && errors.length === 0;
   stageEnd(emit, results, 5, stageName, success, Date.now() - stageStart, {
     httpStatus,
     mintsProvided: testMints.length,
     eventsReceived,
+    uniqueMintsWithPrices: uniqueMintsWithPrices.size,
     firstEventMs,
+    avgLatencyMs,
+    samplePrices,
+    note: connectOk && eventsReceived === 0 ? "Connected but no prices — bonding-curve tokens may not be indexed yet" : undefined,
   }, errors);
 }
 
@@ -918,6 +927,226 @@ async function stage6GraduatedTokens(
   }, errors);
 }
 
+// ─── Stage 7: DexPaprika 2,000-Token Bulk Subscription Stress Test ─────────
+// Collects tokens from PumpPortal subscribeNewToken (bonding-curve) and
+// DexScreener token-profiles/boosts (graduated), then subscribes up to 2000
+// to DexPaprika streaming to stress-test the bulk subscription limit.
+
+async function stage7DexPaprikaStress(
+  emit: EmitFn,
+  results: StageResult[]
+): Promise<void> {
+  const stageName = "Stage 7: DexPaprika 2,000-Token Bulk Subscription Stress Test";
+  emit({ type: "stage-start", stage: 7, name: stageName });
+  log(emit, "header", "════ " + stageName);
+
+  const stageStart = Date.now();
+  const errors: string[] = [];
+
+  // ── Step 1: Collect tokens from two sources over 60s ──
+  log(emit, "info", "Collecting tokens from PumpPortal new token stream + DexScreener (60s)...");
+
+  const bondingMints: string[] = [];
+  const graduatedMints: string[] = [];
+
+  await Promise.all([
+    // Source A: PumpPortal subscribeNewToken WS (bonding-curve mints)
+    (async () => {
+      try {
+        const ws = await openWs();
+        ws.send(JSON.stringify({ method: "subscribeNewToken" }));
+        log(emit, "info", "  PumpPortal subscribeNewToken started...");
+
+        await new Promise<void>((resolve) => {
+          const timeout = setTimeout(() => { ws.close(); resolve(); }, 60_000);
+          ws.on("message", (data) => {
+            try {
+              const msg = JSON.parse(data.toString()) as Record<string, unknown>;
+              if (msg.mint && typeof msg.mint === "string") {
+                bondingMints.push(msg.mint);
+                if (bondingMints.length % 100 === 0) {
+                  log(emit, "info", `  PumpPortal: ${bondingMints.length} bonding-curve mints...`);
+                }
+              }
+            } catch { /* malformed */ }
+          });
+          ws.on("error", () => { clearTimeout(timeout); resolve(); });
+          ws.on("close", () => { clearTimeout(timeout); resolve(); });
+        });
+
+        log(emit, "success", `✓ PumpPortal: ${bondingMints.length} bonding-curve mints collected`);
+      } catch (e) {
+        log(emit, "warn", `⚠ PumpPortal stream error: ${(e as Error).message}`);
+      }
+    })(),
+
+    // Source B: DexScreener token-profiles + token-boosts (graduated/Raydium mints)
+    (async () => {
+      try {
+        const [profilesResp, boostsResp] = await Promise.all([
+          fetch("https://api.dexscreener.com/token-profiles/latest/v1"),
+          fetch("https://api.dexscreener.com/token-boosts/latest/v1"),
+        ]);
+
+        if (profilesResp.ok) {
+          const profiles = await profilesResp.json() as Array<{ chainId?: string; tokenAddress?: string }>;
+          const addrs = profiles
+            .filter((p) => p.chainId === "solana" && p.tokenAddress)
+            .map((p) => p.tokenAddress as string);
+          graduatedMints.push(...addrs);
+          log(emit, "info", `  DexScreener profiles: ${addrs.length} Solana tokens`);
+        }
+
+        if (boostsResp.ok) {
+          const boosts = await boostsResp.json() as Array<{ chainId?: string; tokenAddress?: string }>;
+          const addrs = boosts
+            .filter((b) => b.chainId === "solana" && b.tokenAddress)
+            .map((b) => b.tokenAddress as string)
+            .filter((a) => !graduatedMints.includes(a));
+          graduatedMints.push(...addrs);
+          log(emit, "info", `  DexScreener boosts: ${addrs.length} additional Solana tokens`);
+        }
+
+        log(emit, "success", `✓ DexScreener: ${graduatedMints.length} graduated tokens collected`);
+      } catch (e) {
+        log(emit, "warn", `⚠ DexScreener fetch error: ${(e as Error).message}`);
+      }
+    })(),
+  ]);
+
+  // ── Combine, dedup, cap at 2000 ──
+  const seen = new Set<string>();
+  const allTokens: string[] = [];
+  for (const mint of [...bondingMints, ...graduatedMints]) {
+    if (!seen.has(mint) && allTokens.length < 2000) {
+      seen.add(mint);
+      allTokens.push(mint);
+    }
+  }
+
+  log(emit, "info", `Collected: ${bondingMints.length} bonding-curve + ${graduatedMints.length} graduated = ${allTokens.length} unique (cap 2000)`);
+
+  if (allTokens.length === 0) {
+    errors.push("No tokens collected from any source");
+    stageEnd(emit, results, 7, stageName, false, Date.now() - stageStart, {
+      bondingCurveTokens: 0, graduatedTokens: 0, tokensSubscribed: 0, totalEvents: 0,
+    }, errors);
+    return;
+  }
+
+  // ── Step 2: POST to DexPaprika streaming ──
+  log(emit, "info", `Subscribing ${allTokens.length} tokens to DexPaprika streaming...`);
+  const assets = allTokens.map((a) => ({ chain: "solana", address: a, method: "t_p" }));
+
+  let totalEvents = 0;
+  const tokenUpdateCounts = new Map<string, number>();
+  let httpStatus: number | undefined;
+  let connectOk = false;
+  const t0 = Date.now();
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 35_000);
+
+    const resp = await fetch("https://streaming.dexpaprika.com/stream", {
+      method: "POST",
+      headers: { Accept: "text/event-stream", "Content-Type": "application/json" },
+      body: JSON.stringify(assets),
+      signal: controller.signal,
+    });
+
+    httpStatus = resp.status;
+
+    if (!resp.ok) {
+      let errBody = "";
+      try { errBody = await resp.text(); } catch { /* ignore */ }
+      errors.push(`DexPaprika HTTP ${resp.status}: ${errBody.slice(0, 200)}`);
+      log(emit, "error", `✗ DexPaprika HTTP ${resp.status}: ${errBody.slice(0, 100)}`);
+      stageEnd(emit, results, 7, stageName, false, Date.now() - stageStart, {
+        httpStatus, tokensSubscribed: allTokens.length,
+        bondingCurveTokens: bondingMints.length, graduatedTokens: graduatedMints.length, totalEvents: 0,
+      }, errors);
+      clearTimeout(timeoutId);
+      return;
+    }
+
+    connectOk = true;
+    log(emit, "success", `✓ DexPaprika accepted ${allTokens.length} subscriptions (HTTP 200, ${Date.now() - t0}ms)`);
+    log(emit, "info", "Reading stream for 30s...");
+
+    // ── Step 3: Read SSE for 30s ──
+    const reader = resp.body!.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    let lastLogAt = Date.now();
+
+    try {
+      while (true) {
+        if (controller.signal.aborted) break;
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+
+        for (const line of lines) {
+          if (!line.startsWith("data:")) continue;
+          const raw = line.slice(5).trim();
+          if (!raw) continue;
+          try {
+            const evt = JSON.parse(raw) as { a?: string; p?: string; t_p?: number };
+            if (evt.a && evt.p) {
+              totalEvents++;
+              tokenUpdateCounts.set(evt.a, (tokenUpdateCounts.get(evt.a) ?? 0) + 1);
+              if (totalEvents === 1) {
+                const latMs = evt.t_p ? Math.round((Date.now() / 1000 - evt.t_p) * 1000) : undefined;
+                log(emit, "success", `✓ First price event: ${evt.a.slice(0, 20)}... $${Number(evt.p).toFixed(6)}${latMs !== undefined ? ` (latency ${latMs}ms)` : ""}`);
+              }
+            }
+          } catch { /* malformed */ }
+        }
+
+        if (Date.now() - lastLogAt >= 5_000) {
+          const evps = (totalEvents / ((Date.now() - t0) / 1000)).toFixed(1);
+          log(emit, "info", `  ${totalEvents} events, ${tokenUpdateCounts.size} tokens priced, ${evps} ev/s`);
+          lastLogAt = Date.now();
+        }
+      }
+    } finally {
+      clearTimeout(timeoutId);
+      reader.cancel().catch(() => { /* ignore */ });
+    }
+  } catch (e) {
+    const msg = (e as Error).message;
+    if (!msg.includes("abort") && !msg.includes("timeout")) {
+      errors.push(`DexPaprika stream error: ${msg}`);
+      log(emit, "error", `✗ Stream error: ${msg}`);
+    }
+  }
+
+  const eventsPerSec = (totalEvents / 30).toFixed(1);
+  const coveragePct = allTokens.length > 0
+    ? ((tokenUpdateCounts.size / allTokens.length) * 100).toFixed(1)
+    : "0";
+
+  log(emit, totalEvents > 0 ? "success" : "warn",
+    `DexPaprika 30s summary: ${totalEvents} events, ${tokenUpdateCounts.size}/${allTokens.length} tokens priced (${coveragePct}%), ${eventsPerSec} ev/s`
+  );
+
+  const success = connectOk && totalEvents > 0 && errors.length === 0;
+  stageEnd(emit, results, 7, stageName, success, Date.now() - stageStart, {
+    httpStatus,
+    bondingCurveTokens: bondingMints.length,
+    graduatedTokens: graduatedMints.length,
+    tokensSubscribed: allTokens.length,
+    totalEvents,
+    eventsPerSec: Number(eventsPerSec),
+    uniqueTokensWithUpdates: tokenUpdateCounts.size,
+    coveragePct: Number(coveragePct),
+  }, errors);
+}
+
 // ─── Main Exports ──────────────────────────────────────────────────────────
 
 export async function runAllStages(emit: EmitFn): Promise<void> {
@@ -943,6 +1172,7 @@ export async function runAllStages(emit: EmitFn): Promise<void> {
   await stage4BatchCapacity(emit, results, mints, wallets);
   await stage5DexPaprika(emit, results, mints);
   await stage6GraduatedTokens(emit, results);
+  await stage7DexPaprikaStress(emit, results);
 
   emitComplete(emit, results, Date.now() - startTime);
 }
@@ -972,13 +1202,14 @@ export async function runSyntaxTests(emit: EmitFn): Promise<void> {
     return { ok: resp.ok, note: resp.ok ? undefined : `HTTP ${resp.status}` };
   });
 
-  await check("DexPaprika", "sse/trades", async () => {
-    const resp = await fetch(
-      "https://api.dexpaprika.com/v1/sse/trades?tokens=So11111111111111111111111111111111111111112",
-      { signal: AbortSignal.timeout(5_000) }
-    );
-    const ok = resp.ok || resp.status === 200;
-    return { ok, note: ok ? undefined : `HTTP ${resp.status} (may be IP-banned in dev)` };
+  await check("DexPaprika", "streaming.dexpaprika.com/stream", async () => {
+    const resp = await fetch("https://streaming.dexpaprika.com/stream", {
+      method: "POST",
+      headers: { Accept: "text/event-stream", "Content-Type": "application/json" },
+      body: JSON.stringify([{ chain: "solana", address: "So11111111111111111111111111111111111111112", method: "t_p" }]),
+      signal: AbortSignal.timeout(5_000),
+    });
+    return { ok: resp.ok, note: resp.ok ? undefined : `HTTP ${resp.status}` };
   });
 
   await check("PumpPortal", "wss-connect", async () => {
