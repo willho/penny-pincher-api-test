@@ -24,8 +24,9 @@ export interface BatchStep {
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
-function log(emit: EmitFn, level: string, message: string): void {
-  emit({ type: "log", level, message });
+function log(emit: EmitFn, level: string, message: string, stage?: string): void {
+  const prefix = stage ? `[${stage}] ` : "";
+  emit({ type: "log", level, message: prefix + message, stage });
 }
 
 const PUMPPORTAL_WS = () =>
@@ -74,8 +75,9 @@ async function stage1MintCollection(
   results: StageResult[]
 ): Promise<string[]> {
   const stageName = "Stage 1: Mint Collection (subscribeNewToken from PumpPortal + PumpDev)";
+  const stagePrefix = "STAGE-1";
   emit({ type: "stage-start", stage: 1, name: stageName });
-  log(emit, "header", "════ " + stageName);
+  log(emit, "header", "════ " + stageName, stagePrefix);
 
   const COLLECT_TARGET = 2000;
   const TIMEOUT_MS = 300_000;
@@ -88,16 +90,16 @@ async function stage1MintCollection(
   let pdConnected = false;
 
   try {
-    log(emit, "info", `Attempting dual-source collection (target: ${COLLECT_TARGET} mints in ${TIMEOUT_MS / 1000}s)...`);
+    log(emit, "info", `Attempting dual-source collection (target: ${COLLECT_TARGET} mints, no time limit)...`, stagePrefix);
 
     // Open both connections in parallel
     const ppPromise = openWs()
-      .then((ws) => { ppConnected = true; log(emit, "success", "✓ PumpPortal WebSocket connected"); return ws; })
-      .catch((e) => { log(emit, "warn", `PumpPortal connection failed: ${(e as Error).message}`); return null; });
+      .then((ws) => { ppConnected = true; log(emit, "success", "✓ PumpPortal WebSocket connected", stagePrefix); return ws; })
+      .catch((e) => { log(emit, "warn", `PumpPortal connection failed: ${(e as Error).message}`, stagePrefix); return null; });
 
     const pdPromise = openWsDev()
-      .then((ws) => { pdConnected = true; log(emit, "success", "✓ PumpDev WebSocket connected"); return ws; })
-      .catch((e) => { log(emit, "warn", `PumpDev connection failed: ${(e as Error).message}`); return null; });
+      .then((ws) => { pdConnected = true; log(emit, "success", "✓ PumpDev WebSocket connected", stagePrefix); return ws; })
+      .catch((e) => { log(emit, "warn", `PumpDev connection failed: ${(e as Error).message}`, stagePrefix); return null; });
 
     const [ppWs, pdWs] = await Promise.all([ppPromise, pdPromise]);
 
@@ -128,7 +130,7 @@ async function stage1MintCollection(
               log(emit, "info", `First mint (${source}): ${msg.mint.slice(0, 20)}...`);
             }
             if (mintSet.size % PROGRESS_LOG_INTERVAL === 0) {
-              log(emit, "info", `Progress: ${mintSet.size}/${COLLECT_TARGET} mints collected...`);
+              log(emit, "info", `Progress: ${mintSet.size}/${COLLECT_TARGET} mints collected (${source})...`, stagePrefix);
             }
             if (mintSet.size >= COLLECT_TARGET) {
               clearTimeout(timeout);
@@ -1285,26 +1287,66 @@ export async function runAllStages(emit: EmitFn): Promise<void> {
   const results: StageResult[] = [];
 
   log(emit, "header", "════════════ PENNY-PINCHER API TEST SUITE ════════════");
+  log(emit, "info", "PARALLEL EXECUTION PLAN:", "ORCHESTRATOR");
+  log(emit, "info", "  • Stage 1 (background): Collect 2000+ mints, NO time limit", "ORCHESTRATOR");
+  log(emit, "info", "  • Stage 6 (independent): Start immediately", "ORCHESTRATOR");
+  log(emit, "info", "  • Stage 7 (independent): Start after 10s delay", "ORCHESTRATOR");
+  log(emit, "info", "  • Stage 2 (dependent): Start after Stage 1 completes", "ORCHESTRATOR");
+  log(emit, "info", "  • Stages 3-5 (dependent): Run sequentially after Stage 2", "ORCHESTRATOR");
+  log(emit, "divider", "═══════════════════════════════════════════════════════", "ORCHESTRATOR");
 
-  const mints = await stage1MintCollection(emit, results);
+  // ── Start Stage 1 in background (runs until 2000+ mints collected, no timeout) ──
+  log(emit, "info", ">>> Starting STAGE-1 (mint collection in background, no timeout)...", "ORCHESTRATOR");
+  const stage1Promise = stage1MintCollection(emit, results);
+
+  // ── Stage 6 starts immediately (independent) ──
+  log(emit, "info", ">>> Starting STAGE-6 immediately (independent test)...", "ORCHESTRATOR");
+  const stage6Promise = stage6GraduatedTokens(emit, results);
+
+  // ── Stage 7 starts after 10s delay (independent) ──
+  log(emit, "info", ">>> Scheduling STAGE-7 to start in 10 seconds...", "ORCHESTRATOR");
+  const stage7Promise = (async () => {
+    await new Promise(resolve => setTimeout(resolve, 10_000));
+    log(emit, "info", ">>> Starting STAGE-7 (delayed 10s, independent test)...", "ORCHESTRATOR");
+    return await stage7DexPaprikaStress(emit, results);
+  })();
+
+  // ── Wait for Stage 1 to complete mint collection ──
+  log(emit, "info", "[waiting...] STAGE-1 collecting mints, Stages 3-5 queued, Stages 6-7 running in parallel", "ORCHESTRATOR");
+  const mints = await stage1Promise;
+
   if (mints.length === 0) {
+    log(emit, "error", "STAGE-1 FAILED: collected 0 mints — aborting remaining stages", "ORCHESTRATOR");
+    await Promise.all([stage6Promise, stage7Promise]);
     emitComplete(emit, results, Date.now() - startTime);
     return;
   }
 
+  log(emit, "divider", "═══════════════════════════════════════════════════════", "ORCHESTRATOR");
+  // ── Run Stage 2 (needs Stage 1 mints) ──
+  log(emit, "info", `STAGE-1 COMPLETE: Collected ${mints.length} mints. Starting STAGE-2...`, "ORCHESTRATOR");
   const wallets = await stage2TradeWallets(emit, results, mints);
+
   if (wallets.length === 0) {
-    log(emit, "error", "Stage 2 returned 0 wallets — aborting stages 3 and 4");
+    log(emit, "error", "STAGE-2 FAILED: collected 0 wallets — skipping Stages 3-5", "ORCHESTRATOR");
+    await Promise.all([stage6Promise, stage7Promise]);
     emitComplete(emit, results, Date.now() - startTime);
     return;
   }
 
+  log(emit, "divider", "═══════════════════════════════════════════════════════", "ORCHESTRATOR");
+  // ── Run Stages 3-5 sequentially (all depend on Stage 1 mints and/or Stage 2 wallets) ──
+  log(emit, "info", `STAGE-2 COMPLETE: Collected ${wallets.length} wallets. Starting Stages 3-5 (sequential)...`, "ORCHESTRATOR");
   await stage3WalletHistory(emit, results, wallets);
   await stage4BatchCapacity(emit, results, mints, wallets);
   await stage5DexPaprika(emit, results, mints);
-  await stage6GraduatedTokens(emit, results);
-  await stage7DexPaprikaStress(emit, results);
 
+  log(emit, "divider", "═══════════════════════════════════════════════════════", "ORCHESTRATOR");
+  // ── Wait for Stages 6-7 to complete ──
+  log(emit, "info", "[waiting...] Stages 3-5 complete, waiting for Stages 6-7 (parallel) to finish...", "ORCHESTRATOR");
+  await Promise.all([stage6Promise, stage7Promise]);
+
+  log(emit, "divider", "═══════════════════════════════════════════════════════", "ORCHESTRATOR");
   emitComplete(emit, results, Date.now() - startTime);
 }
 
