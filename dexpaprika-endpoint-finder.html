@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DexPaprika Endpoint Finder</title>
+    <style>
+        body {
+            font-family: monospace;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #1e1e1e;
+            color: #d4d4d4;
+        }
+
+        .container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+
+        .panel {
+            background: #252526;
+            border: 1px solid #3e3e42;
+            border-radius: 4px;
+            padding: 15px;
+        }
+
+        h1 {
+            grid-column: 1 / -1;
+            color: #4ec9b0;
+            margin: 0 0 10px 0;
+        }
+
+        h2 {
+            color: #569cd6;
+            margin-top: 0;
+            font-size: 14px;
+            text-transform: uppercase;
+            border-bottom: 1px solid #3e3e42;
+            padding-bottom: 8px;
+        }
+
+        .form-group {
+            margin-bottom: 12px;
+        }
+
+        label {
+            display: block;
+            font-size: 12px;
+            color: #9cdcfe;
+            margin-bottom: 4px;
+            font-weight: bold;
+        }
+
+        input, textarea {
+            width: 100%;
+            box-sizing: border-box;
+            background: #1e1e1e;
+            border: 1px solid #3e3e42;
+            color: #d4d4d4;
+            padding: 6px;
+            font-family: monospace;
+            font-size: 12px;
+            border-radius: 2px;
+        }
+
+        input:focus, textarea:focus {
+            outline: none;
+            border-color: #569cd6;
+            background: #1a1a1a;
+        }
+
+        textarea {
+            resize: vertical;
+            min-height: 60px;
+        }
+
+        .button-group {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            margin: 12px 0;
+        }
+
+        button {
+            background: #0e639c;
+            color: #fff;
+            border: 1px solid #007acc;
+            padding: 8px 12px;
+            border-radius: 2px;
+            cursor: pointer;
+            font-family: monospace;
+            font-size: 11px;
+            font-weight: bold;
+        }
+
+        button:hover {
+            background: #1177bb;
+        }
+
+        button:active {
+            background: #007acc;
+        }
+
+        button.wide {
+            grid-column: 1 / -1;
+        }
+
+        button.success {
+            background: #0d7e3a;
+            border-color: #107c10;
+        }
+
+        button.success:hover {
+            background: #109d47;
+        }
+
+        button.danger {
+            background: #800000;
+            border-color: #a00000;
+        }
+
+        button.danger:hover {
+            background: #a00000;
+        }
+
+        .output {
+            background: #1a1a1a;
+            border: 1px solid #3e3e42;
+            border-radius: 2px;
+            padding: 10px;
+            font-size: 11px;
+            overflow-x: auto;
+            max-height: 300px;
+            overflow-y: auto;
+            margin-top: 8px;
+        }
+
+        .status {
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 2px;
+            margin-bottom: 8px;
+            font-weight: bold;
+        }
+
+        .status.success {
+            background: #107c10;
+            color: #fff;
+        }
+
+        .status.error {
+            background: #a00000;
+            color: #fff;
+        }
+
+        .status.pending {
+            background: #007acc;
+            color: #fff;
+        }
+
+        .test-buttons {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+        }
+
+        .results {
+            grid-column: 1 / -1;
+        }
+
+        .result-item {
+            background: #252526;
+            border-left: 3px solid #3e3e42;
+            padding: 10px;
+            margin-bottom: 8px;
+            border-radius: 2px;
+        }
+
+        .result-item.success {
+            border-left-color: #107c10;
+        }
+
+        .result-item.error {
+            border-left-color: #a00000;
+        }
+
+        .result-endpoint {
+            color: #ce9178;
+            word-break: break-all;
+            font-size: 11px;
+            margin-bottom: 4px;
+        }
+
+        .result-status {
+            color: #9cdcfe;
+            font-size: 11px;
+            margin-bottom: 4px;
+        }
+
+        .result-preview {
+            background: #1a1a1a;
+            padding: 6px;
+            border-radius: 2px;
+            font-size: 10px;
+            color: #859500;
+            max-height: 100px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .loading {
+            color: #569cd6;
+        }
+    </style>
+</head>
+<body>
+    <h1>🔍 DexPaprika Endpoint Finder</h1>
+
+    <div class="container">
+        <!-- Configuration Panel -->
+        <div class="panel">
+            <h2>Configuration</h2>
+
+            <div class="form-group">
+                <label>Base URL (default: api.dexpaprika.com)</label>
+                <input type="text" id="baseUrl" value="https://api.dexpaprika.com" placeholder="https://api.dexpaprika.com">
+            </div>
+
+            <div class="form-group">
+                <label>Token Addresses (comma-separated, or paste one per line)</label>
+                <textarea id="tokens">EPjFWaLb3odcjGVY9wn9Qo0iRjb3FSPmN9h2yeP7qdc
+Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BjPvFA
+SRMuApVgqbCmmp5EB9Ue6i5DvV5Q5j21XEcuvVLvKX7</textarea>
+            </div>
+
+            <div class="form-group">
+                <label>Custom Endpoint Path (leave blank to auto-test)</label>
+                <input type="text" id="customPath" placeholder="/v1/sse/trades">
+            </div>
+
+            <div class="button-group">
+                <button class="wide success" onclick="testCustomEndpoint()">🧪 Test Custom Endpoint</button>
+            </div>
+        </div>
+
+        <!-- Quick Test Panel -->
+        <div class="panel">
+            <h2>Quick Tests</h2>
+
+            <div class="form-group">
+                <label>Try Common Endpoint Variations</label>
+                <div class="test-buttons">
+                    <button onclick="testEndpoint('/v1/sse/trades')">v1/sse/trades</button>
+                    <button onclick="testEndpoint('/sse/trades')">sse/trades</button>
+                    <button onclick="testEndpoint('/v1/trades')">v1/trades</button>
+                    <button onclick="testEndpoint('/trades')">trades</button>
+                    <button onclick="testEndpoint('/api/v1/sse/trades')">api/v1/sse/trades</button>
+                    <button onclick="testEndpoint('/api/sse/trades')">api/sse/trades</button>
+                    <button onclick="testEndpoint('/v1/stream/trades')">v1/stream/trades</button>
+                    <button onclick="testEndpoint('/stream')">stream</button>
+                </div>
+            </div>
+
+            <div class="form-group">
+                <button class="wide danger" onclick="testAllEndpoints()">🚀 Test All Variations</button>
+            </div>
+        </div>
+
+        <!-- Results Panel -->
+        <div class="panel results">
+            <h2>Results</h2>
+            <div id="results"></div>
+        </div>
+    </div>
+
+    <script>
+        const commonEndpoints = [
+            '/v1/sse/trades',
+            '/sse/trades',
+            '/v1/trades',
+            '/trades',
+            '/api/v1/sse/trades',
+            '/api/sse/trades',
+            '/v1/stream/trades',
+            '/stream',
+            '/v1/subscribe/trades',
+            '/subscribe/trades',
+            '/v1/websocket/trades',
+            '/websocket/trades',
+        ];
+
+        function getTokens() {
+            const tokenInput = document.getElementById('tokens').value;
+            return tokenInput
+                .split(/[\n,]/)
+                .map(t => t.trim())
+                .filter(t => t.length > 0)
+                .slice(0, 3);
+        }
+
+        function buildUrl(endpointPath) {
+            const baseUrl = document.getElementById('baseUrl').value.replace(/\/$/, '');
+            const tokens = getTokens();
+            const tokenQuery = tokens.join(',');
+            return `${baseUrl}${endpointPath}?tokens=${encodeURIComponent(tokenQuery)}`;
+        }
+
+        async function testEndpoint(endpointPath) {
+            const url = buildUrl(endpointPath);
+            const resultsDiv = document.getElementById('results');
+            const resultId = `result-${Date.now()}`;
+
+            const resultHtml = `
+                <div class="result-item" id="${resultId}">
+                    <div class="result-endpoint">POST ${endpointPath}</div>
+                    <div class="result-status"><span class="loading">⏳ Testing...</span></div>
+                    <div class="result-preview"></div>
+                </div>
+            `;
+
+            resultsDiv.insertAdjacentHTML('afterbegin', resultHtml);
+            const resultElement = document.getElementById(resultId);
+            const statusElement = resultElement.querySelector('.result-status');
+            const previewElement = resultElement.querySelector('.result-preview');
+
+            try {
+                const response = await fetch(url, {
+                    method: 'POST',
+                    headers: {
+                        'Accept': 'text/event-stream',
+                    },
+                });
+
+                const statusClass = response.ok ? 'success' : 'error';
+                resultElement.classList.add(statusClass);
+
+                statusElement.innerHTML = `<span class="${statusClass}">HTTP ${response.status}</span> - ${response.statusText}`;
+
+                // Try to read response body
+                const contentType = response.headers.get('content-type') || '';
+                let bodyText = '';
+
+                try {
+                    if (contentType.includes('text') || contentType.includes('html')) {
+                        bodyText = await response.text();
+                    } else {
+                        bodyText = await response.text();
+                    }
+
+                    if (bodyText) {
+                        previewElement.textContent = bodyText.substring(0, 500);
+                        if (bodyText.length > 500) {
+                            previewElement.textContent += '\n... (truncated)';
+                        }
+                    } else {
+                        previewElement.textContent = '(no response body)';
+                    }
+                } catch (e) {
+                    previewElement.textContent = '(could not read response body)';
+                }
+
+            } catch (error) {
+                resultElement.classList.add('error');
+                statusElement.innerHTML = `<span class="error">❌ Error</span> - ${error.message}`;
+                previewElement.textContent = error.toString();
+            }
+        }
+
+        function testCustomEndpoint() {
+            const customPath = document.getElementById('customPath').value;
+            if (!customPath) {
+                alert('Please enter a custom endpoint path (e.g., /v1/sse/trades)');
+                return;
+            }
+            testEndpoint(customPath);
+        }
+
+        async function testAllEndpoints() {
+            document.getElementById('results').innerHTML = '';
+
+            for (const endpoint of commonEndpoints) {
+                await testEndpoint(endpoint);
+                // Small delay to avoid overwhelming the server
+                await new Promise(resolve => setTimeout(resolve, 200));
+            }
+        }
+
+        // Auto-test all on page load
+        window.addEventListener('load', () => {
+            console.log('Page loaded. Ready to test endpoints.');
+            console.log('Click "Test All Variations" button to start testing.');
+        });
+    </script>
+</body>
+</html>
