@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>DexPaprika: PreGrad vs PostGrad Test</title>
+    <style>
+        body {
+            font-family: monospace;
+            background: #0d1117;
+            color: #c9d1d9;
+            padding: 40px;
+            max-width: 600px;
+            margin: 0 auto;
+        }
+        h1 { color: #58a6ff; }
+        button {
+            background: #238636;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            font-size: 16px;
+            cursor: pointer;
+            border-radius: 4px;
+            font-family: monospace;
+        }
+        button:hover { background: #2ea043; }
+        button:disabled { background: #444; cursor: not-allowed; }
+        #result {
+            margin-top: 30px;
+            padding: 20px;
+            background: #161b22;
+            border-radius: 4px;
+            border-left: 4px solid #58a6ff;
+            white-space: pre-wrap;
+            font-size: 14px;
+        }
+        .success { border-left-color: #3fb950; color: #3fb950; }
+        .error { border-left-color: #f85149; color: #f85149; }
+        .loading { opacity: 0.7; }
+    </style>
+</head>
+<body>
+    <h1>🧪 DexPaprika Token Support Test</h1>
+    <p>Checks if DexPaprika supports PreGrad (bonding curve) or PostGrad (graduated) tokens</p>
+
+    <button onclick="runTest()" id="btn">Run Test</button>
+
+    <div id="result"></div>
+
+    <script>
+        async function runTest() {
+            const btn = document.getElementById('btn');
+            const result = document.getElementById('result');
+
+            btn.disabled = true;
+            result.className = 'loading';
+            result.textContent = '⏳ Testing DexPaprika...\n\nFetching tokens...\nTesting PreGrad...\nTesting PostGrad...\n';
+
+            try {
+                const response = await fetch('/api/test');
+                const data = await response.json();
+
+                let output = '📊 DexPaprika Token Support Test\n';
+                output += '='.repeat(40) + '\n\n';
+
+                output += '🔴 PreGrad (Bonding Curve):\n';
+                for (const r of data.pregrad_results) {
+                    output += `  ${r.mint.slice(0, 8)}... → HTTP ${r.status} ${r.ok ? '✅' : '❌'}\n`;
+                }
+                output += data.pregrad_supported ? '  Result: ✅ SUPPORTED\n' : '  Result: ❌ NOT SUPPORTED\n';
+
+                output += '\n🟢 PostGrad (Graduated):\n';
+                for (const r of data.postgrad_results) {
+                    output += `  ${r.mint.slice(0, 8)}... → HTTP ${r.status} ${r.ok ? '✅' : '❌'}\n`;
+                }
+                output += data.postgrad_supported ? '  Result: ✅ SUPPORTED\n' : '  Result: ❌ NOT SUPPORTED\n';
+
+                output += '\n' + '='.repeat(40) + '\n';
+                output += '📋 CONCLUSION:\n';
+
+                if (data.pregrad_supported && data.postgrad_supported) {
+                    output += '✅ DexPaprika supports BOTH PreGrad & PostGrad\n';
+                    result.className = 'success';
+                } else if (data.pregrad_supported) {
+                    output += '🟡 DexPaprika supports ONLY PreGrad\n';
+                } else if (data.postgrad_supported) {
+                    output += '🟡 DexPaprika supports ONLY PostGrad\n';
+                } else {
+                    output += '❌ DexPaprika supports NEITHER (or API issue)\n';
+                    result.className = 'error';
+                }
+
+                result.textContent = output;
+            } catch (error) {
+                result.className = 'error';
+                result.textContent = '❌ Error:\n' + error.message;
+            } finally {
+                btn.disabled = false;
+            }
+        }
+    </script>
+</body>
+</html>

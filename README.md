@@ -36,7 +36,22 @@ cp .env.example .env.local
 npm run test:all
 ```
 
-## Test Stages
+## Quick Test: PreGrad vs PostGrad
+
+**File**: `test-pregrad-vs-postgrad.html`
+
+Tests DexPaprika subscription capability:
+- **PreGrad (🔴)**: 10 bonding-curve tokens from pump.fun
+- **PostGrad (🟢)**: 10 graduated tokens from Raydium/Orca
+
+Simply open in browser and click buttons to:
+1. Fetch tokens from each source
+2. Test DexPaprika SSE subscription
+3. View results (HTTP status + response)
+
+**Key Question**: Can DexPaprika subscribe to both bonding-curve and graduated tokens?
+
+## Full Integration Test Stages
 
 1. **Stage 1** - Mint collection from PumpPortal newtoken stream
 2. **Stage 2** - Token enrichment (price, volume, trends)

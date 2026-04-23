@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>DexPaprika Token Type Test</title>
+  <style>
+    body { font-family: monospace; padding: 20px; background: #1e1e1e; color: #d4d4d4; }
+    .test { margin: 20px 0; padding: 15px; background: #252526; border-left: 3px solid #569cd6; }
+    .success { border-left-color: #107c10; }
+    .error { border-left-color: #a00000; }
+    button { padding: 10px 20px; margin: 5px; background: #0e639c; color: #fff; border: none; cursor: pointer; }
+    pre { background: #1a1a1a; padding: 10px; overflow-x: auto; }
+  </style>
+</head>
+<body>
+  <h1>DexPaprika Token Type Validation</h1>
+  <p>Testing which token types DexPaprika supports</p>
+
+  <button onclick="testGraduatedToken()">Test Graduated Token (USDC)</button>
+  <button onclick="testBondingCurveToken()">Test Bonding-Curve Token (Random)</button>
+  <button onclick="clearResults()">Clear Results</button>
+
+  <div id="results"></div>
+
+  <script>
+    const GRADUATED_TOKEN = "EPjFWaLb3odcjGVY9wn9Qo0iRjb3FSPmN9h2yeP7qdc"; // USDC on Solana
+    const BONDING_CURVE_EXAMPLES = [
+      "BuZJLGixoCeR36vug21j3gM6B2kNywSFKJ8kSr9q5yt", // Random bonding-curve from logs
+      "9VimYprbUJDzkpnQD3cKV8SQ6H8zEHVTqKk2u7GKEwJ", // Random from logs
+    ];
+
+    function log(test, success, message) {
+      const results = document.getElementById('results');
+      const div = document.createElement('div');
+      div.className = `test ${success ? 'success' : 'error'}`;
+      div.innerHTML = `
+        <strong>${test}</strong>: ${success ? '✓' : '✗'}<br>
+        <pre>${message}</pre>
+      `;
+      results.insertBefore(div, results.firstChild);
+    }
+
+    async function testToken(tokenAddress, label) {
+      try {
+        const asset = { chain: "solana", address: tokenAddress, method: "t_p" };
+        const response = await fetch("https://streaming.dexpaprika.com/stream", {
+          method: "POST",
+          headers: {
+            "Accept": "text/event-stream",
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify([asset]),
+          signal: AbortSignal.timeout(5000)
+        });
+
+        const status = response.status;
+        const body = await response.text();
+
+        if (status === 200) {
+          log(`${label} (${tokenAddress.slice(0,16)}...)`, true,
+            `HTTP 200 - DexPaprika accepted this token\nResponse: ${body.slice(0, 200)}`);
+        } else {
+          log(`${label} (${tokenAddress.slice(0,16)}...)`, false,
+            `HTTP ${status} - ${body.slice(0, 200)}`);
+        }
+      } catch (e) {
+        log(`${label}`, false, `Error: ${e.message}`);
+      }
+    }
+
+    async function testGraduatedToken() {
+      await testToken(GRADUATED_TOKEN, "Graduated Token (USDC)");
+    }
+
+    async function testBondingCurveToken() {
+      const token = BONDING_CURVE_EXAMPLES[Math.floor(Math.random() * BONDING_CURVE_EXAMPLES.length)];
+      await testToken(token, "Bonding-Curve Token");
+    }
+
+    function clearResults() {
+      document.getElementById('results').innerHTML = '';
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PreGrad vs PostGrad DexPaprika Test</title>
+    <style>
+        body {
+            font-family: 'Courier New', monospace;
+            background: #0d1117;
+            color: #c9d1d9;
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        h1 { color: #58a6ff; }
+        .test-section {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin: 20px 0;
+        }
+        .panel {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 15px;
+        }
+        .panel h2 { margin-top: 0; color: #79c0ff; }
+        button {
+            background: #238636;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            margin: 5px;
+            cursor: pointer;
+            border-radius: 4px;
+        }
+        button:hover { background: #2ea043; }
+        button:disabled { background: #444; cursor: not-allowed; }
+        .log {
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 4px;
+            padding: 10px;
+            height: 300px;
+            overflow-y: auto;
+            font-size: 12px;
+            margin: 10px 0;
+        }
+        .log-entry {
+            margin: 3px 0;
+            padding: 2px;
+        }
+        .log-entry.info { color: #79c0ff; }
+        .log-entry.success { color: #3fb950; }
+        .log-entry.error { color: #f85149; }
+        .log-entry.warning { color: #d29922; }
+        .token-list {
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 4px;
+            padding: 10px;
+            max-height: 200px;
+            overflow-y: auto;
+            font-size: 11px;
+            margin: 10px 0;
+        }
+        .token-item {
+            padding: 4px;
+            margin: 2px 0;
+            background: #161b22;
+            border-left: 3px solid #58a6ff;
+            word-break: break-all;
+        }
+        .token-item.success { border-left-color: #3fb950; }
+        .token-item.error { border-left-color: #f85149; }
+        .status { margin: 10px 0; padding: 10px; border-radius: 4px; }
+        .status.pending { background: #d2992240; color: #d29922; }
+        .status.success { background: #3fb95040; color: #3fb950; }
+        .status.error { background: #f8514940; color: #f85149; }
+    </style>
+</head>
+<body>
+    <h1>🧪 PreGrad vs PostGrad DexPaprika Subscription Test</h1>
+    <p>Tests DexPaprika subscription with 10 bonding-curve tokens (PreGrad) vs 10 graduated tokens (PostGrad)</p>
+
+    <div class="test-section">
+        <!-- PreGrad (Pump.fun Bonding Curve) -->
+        <div class="panel">
+            <h2>🔴 PreGrad Tokens (Pump.fun)</h2>
+            <button onclick="fetchAndTestPregrad()">Fetch 10 PreGrad + Test DexPaprika</button>
+            <div class="status" id="pregrad-status">Ready</div>
+
+            <h3>Tokens Collected:</h3>
+            <div class="token-list" id="pregrad-tokens"></div>
+
+            <h3>DexPaprika Test Results:</h3>
+            <div class="log" id="pregrad-log"></div>
+        </div>
+
+        <!-- PostGrad (Raydium/Orca Graduated) -->
+        <div class="panel">
+            <h2>🟢 PostGrad Tokens (Graduated)</h2>
+            <button onclick="fetchAndTestPostgrad()">Fetch 10 PostGrad + Test DexPaprika</button>
+            <div class="status" id="postgrad-status">Ready</div>
+
+            <h3>Tokens Collected:</h3>
+            <div class="token-list" id="postgrad-tokens"></div>
+
+            <h3>DexPaprika Test Results:</h3>
+            <div class="log" id="postgrad-log"></div>
+        </div>
+    </div>
+
+    <script>
+        const CORS_PROXY = 'https://cors-anywhere.herokuapp.com/';
+        const DEXPAPRIKA_SSE = 'https://api.dexpaprika.com/v1/sse/trades';
+
+        function log(elementId, message, type = 'info') {
+            const logEl = document.getElementById(elementId);
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            logEl.insertBefore(entry, logEl.firstChild);
+        }
+
+        function displayTokens(elementId, tokens) {
+            const container = document.getElementById(elementId);
+            container.innerHTML = '';
+            tokens.forEach(t => {
+                const div = document.createElement('div');
+                div.className = 'token-item';
+                div.textContent = `${t.symbol || 'N/A'} - ${t.mint}`;
+                container.appendChild(div);
+            });
+        }
+
+        function setStatus(elementId, message, type = 'pending') {
+            const el = document.getElementById(elementId);
+            el.className = `status ${type}`;
+            el.textContent = message;
+        }
+
+        // ===== PREGRAD (Pump.fun) =====
+        async function fetchAndTestPregrad() {
+            setStatus('pregrad-status', 'Fetching pregrad tokens from Pump.fun...', 'pending');
+            log('pregrad-log', 'Starting pregrad test...', 'info');
+
+            try {
+                // Fetch trending/new tokens from Pump.fun via DexScreener
+                log('pregrad-log', 'Querying pump.fun trending tokens...', 'info');
+
+                // Use a working pump.fun endpoint or fallback
+                const response = await fetch(`${CORS_PROXY}https://api.dexscreener.com/latest/dex/tokens?order=volume&limit=50`, {
+                    headers: { 'Origin': window.location.origin }
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+
+                const data = await response.json();
+                const pregradTokens = data.pairs
+                    ?.filter(p => p.dexId === 'pumpfun' || p.pairAddress?.includes('pump'))
+                    ?.slice(0, 10)
+                    ?.map(p => ({
+                        mint: p.baseToken.address,
+                        symbol: p.baseToken.symbol,
+                        name: p.baseToken.name
+                    })) || [];
+
+                if (pregradTokens.length === 0) {
+                    log('pregrad-log', 'No pump.fun tokens found, using examples', 'warning');
+                    // Fallback examples
+                    pregradTokens.push(
+                        { mint: 'BuZJLGixoCeR36vug21j3gM6B2kNywSFKJ8kSr9q5yt', symbol: 'PFT1', name: 'PumpFun Example 1' },
+                        { mint: '9VimYprbUJDzkpnQD3cKV8SQ6H8zEHVTqKk2u7GKEwJ', symbol: 'PFT2', name: 'PumpFun Example 2' }
+                    );
+                }
+
+                displayTokens('pregrad-tokens', pregradTokens);
+                log('pregrad-log', `Collected ${pregradTokens.length} pregrad tokens`, 'success');
+
+                // Test DexPaprika subscription
+                await testDexPaprikaSubscription(pregradTokens, 'pregrad-log', 'pregrad-status');
+
+            } catch (error) {
+                log('pregrad-log', `Error: ${error.message}`, 'error');
+                setStatus('pregrad-status', `Failed: ${error.message}`, 'error');
+            }
+        }
+
+        // ===== POSTGRAD (Raydium/Orca) =====
+        async function fetchAndTestPostgrad() {
+            setStatus('postgrad-status', 'Fetching postgrad tokens from DexScreener...', 'pending');
+            log('postgrad-log', 'Starting postgrad test...', 'info');
+
+            try {
+                log('postgrad-log', 'Querying DexScreener trending tokens...', 'info');
+
+                const response = await fetch(`${CORS_PROXY}https://api.dexscreener.com/latest/dex/tokens?order=volume&limit=50`, {
+                    headers: { 'Origin': window.location.origin }
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+
+                const data = await response.json();
+                const postgradTokens = data.pairs
+                    ?.filter(p => (p.dexId === 'raydium' || p.dexId === 'orca') && p.baseToken.address)
+                    ?.slice(0, 10)
+                    ?.map(p => ({
+                        mint: p.baseToken.address,
+                        symbol: p.baseToken.symbol,
+                        name: p.baseToken.name,
+                        dex: p.dexId
+                    })) || [];
+
+                if (postgradTokens.length === 0) {
+                    log('postgrad-log', 'No graduated tokens found, using examples', 'warning');
+                    postgradTokens.push(
+                        { mint: 'EPjFWaLb3odcjGVY9wn9Qo0iRjb3FSPmN9h2yeP7qdc', symbol: 'USDC', name: 'USD Coin', dex: 'raydium' },
+                        { mint: 'Es9vMFrzaCERmJfrF4H2FYD4KohyrHEmbSpVfPSwbh8', symbol: 'USDCet', name: 'Bridged USDC', dex: 'orca' }
+                    );
+                }
+
+                displayTokens('postgrad-tokens', postgradTokens);
+                log('postgrad-log', `Collected ${postgradTokens.length} postgrad tokens`, 'success');
+
+                // Test DexPaprika subscription
+                await testDexPaprikaSubscription(postgradTokens, 'postgrad-log', 'postgrad-status');
+
+            } catch (error) {
+                log('postgrad-log', `Error: ${error.message}`, 'error');
+                setStatus('postgrad-status', `Failed: ${error.message}`, 'error');
+            }
+        }
+
+        // ===== DEXPAPRIKA TEST =====
+        async function testDexPaprikaSubscription(tokens, logId, statusId) {
+            log(logId, `Testing DexPaprika with ${tokens.length} tokens...`, 'info');
+            const mints = tokens.map(t => t.mint).join(',');
+
+            try {
+                log(logId, `Connecting to DexPaprika SSE...`, 'info');
+
+                const response = await fetch(DEXPAPRIKA_SSE, {
+                    method: 'POST',
+                    headers: {
+                        'Accept': 'text/event-stream',
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify([
+                        { chain: 'solana', address: mints, method: 't_p' }
+                    ])
+                });
+
+                const status = response.status;
+                const body = await response.text();
+
+                if (status === 200) {
+                    log(logId, `✅ HTTP 200 - DexPaprika accepted`, 'success');
+                    log(logId, `Response preview: ${body.substring(0, 150)}...`, 'success');
+                    setStatus(statusId, '✅ SUCCESS - DexPaprika subscription successful', 'success');
+                } else {
+                    log(logId, `❌ HTTP ${status}`, 'error');
+                    log(logId, `Response: ${body.substring(0, 200)}`, 'error');
+                    setStatus(statusId, `❌ FAILED - HTTP ${status}`, 'error');
+                }
+
+            } catch (error) {
+                log(logId, `Connection error: ${error.message}`, 'error');
+                setStatus(statusId, `Error: ${error.message}`, 'error');
+            }
+        }
+
+        // Auto-test both on load
+        window.addEventListener('load', () => {
+            log('pregrad-log', 'Page loaded. Click button to start test.', 'info');
+            log('postgrad-log', 'Page loaded. Click button to start test.', 'info');
+        });
+    </script>
+</body>
+</html>

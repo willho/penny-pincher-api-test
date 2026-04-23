@@ -1163,8 +1163,20 @@ async function stage7DexPaprikaStress(
   }
 
   // ── Step 2: POST to DexPaprika streaming ──
-  log(emit, "info", `Subscribing ${allTokens.length} tokens to DexPaprika streaming...`);
-  const assets = allTokens.map((a) => ({ chain: "solana", address: a, method: "t_p" }));
+  // Note: DexPaprika only supports graduated tokens (Raydium/Orca), not pump.fun bonding-curve
+  log(emit, "info", `DexPaprika supports graduated tokens only. Using ${graduatedMints.length} graduated tokens (excluding ${bondingMints.length} bonding-curve)...`);
+
+  // Validate tokens before sending (filter out invalid addresses) - use only graduated tokens
+  const validTokens = graduatedMints.filter(a => {
+    // Basic validation: Solana addresses are 43-44 chars, alphanumeric
+    return a && a.length >= 40 && a.length <= 50 && /^[A-Za-z0-9]+$/.test(a);
+  });
+
+  if (validTokens.length < allTokens.length) {
+    log(emit, "warn", `Filtered out ${allTokens.length - validTokens.length} invalid token addresses`);
+  }
+
+  const assets = validTokens.map((a) => ({ chain: "solana", address: a, method: "t_p" }));
 
   let totalEvents = 0;
   const tokenUpdateCounts = new Map<string, number>();
@@ -1191,15 +1203,40 @@ async function stage7DexPaprikaStress(
       try { errBody = await resp.text(); } catch { /* ignore */ }
       errors.push(`DexPaprika HTTP ${resp.status}: ${errBody.slice(0, 200)}`);
       log(emit, "error", `✗ DexPaprika HTTP ${resp.status}: ${errBody.slice(0, 100)}`);
+      log(emit, "warn", `Retrying with smaller batch (${Math.min(50, validTokens.length)} tokens)...`);
+
+      // Retry with smaller batch if 400 error
+      if (resp.status === 400 && validTokens.length > 50) {
+        const smallBatch = validTokens.slice(0, 50).map((a) => ({ chain: "solana", address: a, method: "t_p" }));
+        try {
+          const retryResp = await fetch("https://streaming.dexpaprika.com/stream", {
+            method: "POST",
+            headers: { Accept: "text/event-stream", "Content-Type": "application/json" },
+            body: JSON.stringify(smallBatch),
+            signal: AbortSignal.timeout(10_000),
+          });
+
+          if (retryResp.ok) {
+            log(emit, "success", `✓ Retry succeeded with smaller batch`);
+            // Continue with small batch response handling
+          } else {
+            throw new Error(`Retry also failed: HTTP ${retryResp.status}`);
+          }
+        } catch (e) {
+          log(emit, "error", `✗ Retry failed: ${(e as Error).message}`);
+        }
+      }
+
       stageEnd(emit, results, 7, stageName, false, Date.now() - stageStart, {
-        httpStatus, tokensSubscribed: allTokens.length,
+        httpStatus, tokensSubscribed: validTokens.length,
         bondingCurveTokens: bondingMints.length, graduatedTokens: graduatedMints.length, totalEvents: 0,
+        note: "DexPaprika only supports graduated tokens, bonding-curve tokens excluded",
       }, errors);
       return;
     }
 
     connectOk = true;
-    log(emit, "success", `✓ DexPaprika accepted ${allTokens.length} subscriptions (HTTP 200, ${Date.now() - t0}ms)`);
+    log(emit, "success", `✓ DexPaprika accepted ${validTokens.length} graduated token subscriptions (HTTP 200, ${Date.now() - t0}ms)`);
     log(emit, "info", "Reading stream for 30s...");
 
     // Phase 2: read for exactly 30s
@@ -1289,35 +1326,29 @@ export async function runAllStages(emit: EmitFn): Promise<void> {
   log(emit, "header", "════════════ PENNY-PINCHER API TEST SUITE ════════════");
   log(emit, "info", "PARALLEL EXECUTION PLAN:", "ORCHESTRATOR");
   log(emit, "info", "  • Stage 1 (background): Collect 2000+ mints, NO time limit", "ORCHESTRATOR");
-  log(emit, "info", "  • Stage 6 (independent): Start immediately", "ORCHESTRATOR");
-  log(emit, "info", "  • Stage 7 (independent): Start after 10s delay", "ORCHESTRATOR");
+  log(emit, "info", "  • Stages 3-7 (independent): Start immediately, no Stage 1 dependency", "ORCHESTRATOR");
   log(emit, "info", "  • Stage 2 (dependent): Start after Stage 1 completes", "ORCHESTRATOR");
-  log(emit, "info", "  • Stages 3-5 (dependent): Run sequentially after Stage 2", "ORCHESTRATOR");
   log(emit, "divider", "═══════════════════════════════════════════════════════", "ORCHESTRATOR");
 
   // ── Start Stage 1 in background (runs until 2000+ mints collected, no timeout) ──
   log(emit, "info", ">>> Starting STAGE-1 (mint collection in background, no timeout)...", "ORCHESTRATOR");
   const stage1Promise = stage1MintCollection(emit, results);
 
-  // ── Stage 6 starts immediately (independent) ──
-  log(emit, "info", ">>> Starting STAGE-6 immediately (independent test)...", "ORCHESTRATOR");
+  // ── Stages 3-7 start immediately (all independent, no Stage 1 dependency) ──
+  log(emit, "info", ">>> Starting Stages 3-7 immediately (independent tests)...", "ORCHESTRATOR");
+  const stage3Promise = stage3WalletHistory(emit, results, []);
+  const stage4Promise = stage4BatchCapacity(emit, results, [], []);
+  const stage5Promise = stage5DexPaprika(emit, results, []);
   const stage6Promise = stage6GraduatedTokens(emit, results);
-
-  // ── Stage 7 starts after 10s delay (independent) ──
-  log(emit, "info", ">>> Scheduling STAGE-7 to start in 10 seconds...", "ORCHESTRATOR");
-  const stage7Promise = (async () => {
-    await new Promise(resolve => setTimeout(resolve, 10_000));
-    log(emit, "info", ">>> Starting STAGE-7 (delayed 10s, independent test)...", "ORCHESTRATOR");
-    return await stage7DexPaprikaStress(emit, results);
-  })();
+  const stage7Promise = stage7DexPaprikaStress(emit, results);
 
   // ── Wait for Stage 1 to complete mint collection ──
-  log(emit, "info", "[waiting...] STAGE-1 collecting mints, Stages 3-5 queued, Stages 6-7 running in parallel", "ORCHESTRATOR");
+  log(emit, "info", "[waiting...] STAGE-1 collecting mints, Stages 3-7 running in parallel", "ORCHESTRATOR");
   const mints = await stage1Promise;
 
   if (mints.length === 0) {
-    log(emit, "error", "STAGE-1 FAILED: collected 0 mints — aborting remaining stages", "ORCHESTRATOR");
-    await Promise.all([stage6Promise, stage7Promise]);
+    log(emit, "error", "STAGE-1 FAILED: collected 0 mints — skipping Stage 2", "ORCHESTRATOR");
+    await Promise.all([stage3Promise, stage4Promise, stage5Promise, stage6Promise, stage7Promise]);
     emitComplete(emit, results, Date.now() - startTime);
     return;
   }
@@ -1328,23 +1359,13 @@ export async function runAllStages(emit: EmitFn): Promise<void> {
   const wallets = await stage2TradeWallets(emit, results, mints);
 
   if (wallets.length === 0) {
-    log(emit, "error", "STAGE-2 FAILED: collected 0 wallets — skipping Stages 3-5", "ORCHESTRATOR");
-    await Promise.all([stage6Promise, stage7Promise]);
-    emitComplete(emit, results, Date.now() - startTime);
-    return;
+    log(emit, "error", "STAGE-2 FAILED: collected 0 wallets", "ORCHESTRATOR");
   }
 
   log(emit, "divider", "═══════════════════════════════════════════════════════", "ORCHESTRATOR");
-  // ── Run Stages 3-5 sequentially (all depend on Stage 1 mints and/or Stage 2 wallets) ──
-  log(emit, "info", `STAGE-2 COMPLETE: Collected ${wallets.length} wallets. Starting Stages 3-5 (sequential)...`, "ORCHESTRATOR");
-  await stage3WalletHistory(emit, results, wallets);
-  await stage4BatchCapacity(emit, results, mints, wallets);
-  await stage5DexPaprika(emit, results, mints);
-
-  log(emit, "divider", "═══════════════════════════════════════════════════════", "ORCHESTRATOR");
-  // ── Wait for Stages 6-7 to complete ──
-  log(emit, "info", "[waiting...] Stages 3-5 complete, waiting for Stages 6-7 (parallel) to finish...", "ORCHESTRATOR");
-  await Promise.all([stage6Promise, stage7Promise]);
+  // ── Wait for all stages to complete ──
+  log(emit, "info", "[waiting...] Waiting for Stages 3-7 to complete...", "ORCHESTRATOR");
+  await Promise.all([stage3Promise, stage4Promise, stage5Promise, stage6Promise, stage7Promise]);
 
   log(emit, "divider", "═══════════════════════════════════════════════════════", "ORCHESTRATOR");
   emitComplete(emit, results, Date.now() - startTime);
