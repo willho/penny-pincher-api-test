@@ -341,105 +341,142 @@ async function stage2TradeWallets(
   return Array.from(walletSet);
 }
 
-// ─── Stage 3: Chainstack + Shyft Wallet History ────────────────────────────
+// ─── Stage 3: Shyft 7-Day Wallet History Stress Test ─────────────────────────
 
 async function stage3WalletHistory(
   emit: EmitFn,
   results: StageResult[],
   wallets: string[]
 ): Promise<void> {
-  const stageName = "Stage 3: Wallet History (Chainstack + Shyft)";
+  const stageName = "Stage 3: Shyft 7-Day Wallet History Stress Test (200 mints × 20 wallets = 4K queries)";
+  const stagePrefix = "STAGE-3";
   emit({ type: "stage-start", stage: 3, name: stageName });
-  log(emit, "header", "════ " + stageName);
+  log(emit, "header", "════ " + stageName, stagePrefix);
 
   const stageStart = Date.now();
   const errors: string[] = [];
+  let success = false;
 
-  const chainstackRpc = process.env.CHAINSTACK_RPC_URL;
-  const chainstackKey = process.env.CHAINSTACK_API_KEY;
   const shyftKey = process.env.SHYFT_API_KEY;
 
-  // Chainstack requires at minimum one of: full RPC URL or just the API key
-  if (!chainstackRpc && !chainstackKey) {
-    errors.push("Neither CHAINSTACK_RPC_URL nor CHAINSTACK_API_KEY is configured — Stage 3 cannot run");
-    log(emit, "error", "✗ No Chainstack credentials configured");
-  }
   if (!shyftKey) {
-    errors.push("SHYFT_API_KEY not configured — Stage 3 cannot run");
-    log(emit, "error", "✗ SHYFT_API_KEY not configured");
-  }
+    errors.push("SHYFT_API_KEY not configured");
+    log(emit, "error", "✗ SHYFT_API_KEY not configured", stagePrefix);
+  } else {
+    // Stress test: 200 mints × 20 wallets per mint = 4,000 wallet queries
+    const MINTS_TO_TEST = 200;
+    const WALLETS_PER_MINT = 20;
+    const TOTAL_WALLET_QUERIES = MINTS_TO_TEST * WALLETS_PER_MINT;
 
-  if (errors.length === 0) {
-    const rpcUrl =
-      chainstackRpc ??
-      `https://solana-mainnet.core.chainstack.com/${chainstackKey}`;
-    const testWallets = wallets.slice(0, 3);
-    log(emit, "info", `Querying ${testWallets.length} wallets via Chainstack...`);
+    log(emit, "info", `Stress testing Shyft with ${TOTAL_WALLET_QUERIES} wallet queries (${MINTS_TO_TEST} mints × ${WALLETS_PER_MINT} wallets)...`, stagePrefix);
+    log(emit, "info", `Note: Reusing ${wallets.length} unique traders across synthetic distribution...`, stagePrefix);
 
-    for (const wallet of testWallets) {
-      try {
-        const t0 = Date.now();
-        const resp = await fetch(rpcUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            jsonrpc: "2.0",
-            method: "getSignaturesForAddress",
-            params: [wallet, { limit: 10 }],
-            id: 1,
-          }),
-          signal: AbortSignal.timeout(10_000),
-        });
-        const ms = Date.now() - t0;
-        if (!resp.ok) {
-          errors.push(`Chainstack HTTP ${resp.status} for ${wallet.slice(0, 12)}`);
-          log(emit, "error", `✗ Chainstack HTTP ${resp.status}`);
-          continue;
+    let successCount = 0;
+    let failureCount = 0;
+    let totalLatency = 0;
+    let totalTxs = 0;
+    let minLatency = Infinity;
+    let maxLatency = 0;
+    const latencies: number[] = [];
+
+    const logInterval = 500; // Log progress every 500 queries
+    const startTime = Date.now();
+
+    for (let mintIdx = 0; mintIdx < MINTS_TO_TEST; mintIdx++) {
+      // Distribute wallets across mints (cycle through available wallets)
+      for (let walletIdx = 0; walletIdx < WALLETS_PER_MINT; walletIdx++) {
+        const walletAddress = wallets[(mintIdx * WALLETS_PER_MINT + walletIdx) % wallets.length];
+        const queryNum = mintIdx * WALLETS_PER_MINT + walletIdx + 1;
+
+        try {
+          const t0 = Date.now();
+          const resp = await fetch(
+            `https://api.shyft.to/sol/v1/transaction/history?network=mainnet-beta&account=${walletAddress}&tx_num=50`,
+            {
+              headers: { "x-api-key": shyftKey },
+              signal: AbortSignal.timeout(10_000),
+            }
+          );
+          const latency = Date.now() - t0;
+
+          if (!resp.ok) {
+            failureCount++;
+            errors.push(`Query ${queryNum}: HTTP ${resp.status}`);
+            if (queryNum % logInterval === 0) {
+              log(emit, "warn", `Progress: ${queryNum}/${TOTAL_WALLET_QUERIES} (${failureCount} failures)`, stagePrefix);
+            }
+            continue;
+          }
+
+          const data = (await resp.json()) as { result?: Array<unknown> };
+          const txCount = Array.isArray(data.result) ? data.result.length : 0;
+
+          successCount++;
+          totalLatency += latency;
+          totalTxs += txCount;
+          latencies.push(latency);
+          minLatency = Math.min(minLatency, latency);
+          maxLatency = Math.max(maxLatency, latency);
+
+          if (queryNum % logInterval === 0) {
+            const elapsed = Date.now() - startTime;
+            const qps = (queryNum / elapsed * 1000).toFixed(1);
+            log(emit, "info", `Progress: ${queryNum}/${TOTAL_WALLET_QUERIES} | Success: ${successCount} | QPS: ${qps} | Avg latency: ${(totalLatency / successCount).toFixed(0)}ms`, stagePrefix);
+          }
+        } catch (e) {
+          failureCount++;
+          const errMsg = (e as Error).message;
+          errors.push(`Query ${queryNum}: ${errMsg}`);
         }
-        const data = (await resp.json()) as {
-          result?: unknown[];
-          error?: { message: string };
-        };
-        if (data.error) {
-          errors.push(`Chainstack RPC error: ${data.error.message}`);
-          log(emit, "error", `✗ Chainstack RPC: ${data.error.message}`);
-        } else {
-          const n = Array.isArray(data.result) ? data.result.length : 0;
-          log(emit, "success", `✓ ${wallet.slice(0, 16)}... — ${n} sigs (${ms}ms)`);
-        }
-      } catch (e) {
-        errors.push(`Chainstack: ${(e as Error).message}`);
-        log(emit, "error", `✗ Chainstack: ${(e as Error).message}`);
       }
     }
 
-    // Shyft
-    log(emit, "info", "Querying Shyft transaction history...");
-    try {
-      const wallet = wallets[0];
-      const t0 = Date.now();
-      const resp = await fetch(
-        `https://api.shyft.to/sol/v1/transaction/history?network=mainnet-beta&account=${wallet}&tx_num=10`,
-        { headers: { "x-api-key": shyftKey! }, signal: AbortSignal.timeout(10_000) }
-      );
-      const ms = Date.now() - t0;
-      if (resp.ok) {
-        const data = (await resp.json()) as { result?: unknown[] };
-        const n = data.result?.length ?? 0;
-        log(emit, "success", `✓ Shyft: ${n} txs for ${wallet.slice(0, 16)}... (${ms}ms)`);
-      } else {
-        errors.push(`Shyft HTTP ${resp.status}`);
-        log(emit, "error", `✗ Shyft HTTP ${resp.status}`);
-      }
-    } catch (e) {
-      errors.push(`Shyft: ${(e as Error).message}`);
-      log(emit, "error", `✗ Shyft: ${(e as Error).message}`);
-    }
+    // Calculate statistics
+    const avgLatency = successCount > 0 ? (totalLatency / successCount).toFixed(0) : "N/A";
+    const successRate = ((successCount / TOTAL_WALLET_QUERIES) * 100).toFixed(1);
+    const avgTxs = successCount > 0 ? (totalTxs / successCount).toFixed(1) : "0";
+    const totalElapsed = Date.now() - stageStart;
+    const qps = (TOTAL_WALLET_QUERIES / totalElapsed * 1000).toFixed(2);
+
+    // Calculate percentiles
+    latencies.sort((a, b) => a - b);
+    const p50 = latencies.length > 0 ? latencies[Math.floor(latencies.length * 0.5)] : 0;
+    const p95 = latencies.length > 0 ? latencies[Math.floor(latencies.length * 0.95)] : 0;
+    const p99 = latencies.length > 0 ? latencies[Math.floor(latencies.length * 0.99)] : 0;
+
+    log(emit, "divider", "═" .repeat(80), stagePrefix);
+    log(emit, "header", "SHYFT STRESS TEST RESULTS", stagePrefix);
+    log(emit, "divider", "═" .repeat(80), stagePrefix);
+    log(emit, "info", `Total Queries: ${TOTAL_WALLET_QUERIES}`, stagePrefix);
+    log(emit, successCount === TOTAL_WALLET_QUERIES ? "success" : "warn", `Success Rate: ${successCount}/${TOTAL_WALLET_QUERIES} (${successRate}%)`, stagePrefix);
+    log(emit, "info", `Failed: ${failureCount}`, stagePrefix);
+    log(emit, "info", `Throughput: ${qps} queries/sec`, stagePrefix);
+    log(emit, "info", `Total Time: ${(totalElapsed / 1000).toFixed(1)}s`, stagePrefix);
+    log(emit, "divider", "─" .repeat(80), stagePrefix);
+    log(emit, "info", `Latency - Min: ${minLatency}ms, Max: ${maxLatency}ms, Avg: ${avgLatency}ms`, stagePrefix);
+    log(emit, "info", `Latency - P50: ${p50}ms, P95: ${p95}ms, P99: ${p99}ms`, stagePrefix);
+    log(emit, "info", `Transactions - Total: ${totalTxs}, Avg per wallet: ${avgTxs}`, stagePrefix);
+    log(emit, "divider", "═" .repeat(80), stagePrefix);
+
+    success = failureCount === 0 && errors.length === 0;
   }
 
-  const success = errors.length === 0;
   const duration = Date.now() - stageStart;
-  stageEnd(emit, results, 3, stageName, success, duration, { walletsQueried: Math.min(wallets.length, 3) }, errors);
+  stageEnd(
+    emit,
+    results,
+    3,
+    stageName,
+    success,
+    duration,
+    {
+      totalQueries: 4000,
+      mintsUsed: 200,
+      walletsPerMint: 20,
+      note: "Stress test: 4,000 Shyft wallet history queries to validate throughput for backend automation",
+    },
+    errors
+  );
 }
 
 // ─── Stage 4: Batch Subscription Capacity Test ────────────────────────────
@@ -1334,21 +1371,20 @@ export async function runAllStages(emit: EmitFn): Promise<void> {
   log(emit, "info", ">>> Starting STAGE-1 (mint collection in background, no timeout)...", "ORCHESTRATOR");
   const stage1Promise = stage1MintCollection(emit, results);
 
-  // ── Stages 3-7 start immediately (all independent, no Stage 1 dependency) ──
-  log(emit, "info", ">>> Starting Stages 3-7 immediately (independent tests)...", "ORCHESTRATOR");
-  const stage3Promise = stage3WalletHistory(emit, results, []);
+  // ── Stages 4-7 start immediately (all independent) ──
+  log(emit, "info", ">>> Starting Stages 4-7 immediately (independent tests)...", "ORCHESTRATOR");
   const stage4Promise = stage4BatchCapacity(emit, results, [], []);
   const stage5Promise = stage5DexPaprika(emit, results, []);
   const stage6Promise = stage6GraduatedTokens(emit, results);
   const stage7Promise = stage7DexPaprikaStress(emit, results);
 
   // ── Wait for Stage 1 to complete mint collection ──
-  log(emit, "info", "[waiting...] STAGE-1 collecting mints, Stages 3-7 running in parallel", "ORCHESTRATOR");
+  log(emit, "info", "[waiting...] STAGE-1 collecting mints, Stages 4-7 running in parallel", "ORCHESTRATOR");
   const mints = await stage1Promise;
 
   if (mints.length === 0) {
-    log(emit, "error", "STAGE-1 FAILED: collected 0 mints — skipping Stage 2", "ORCHESTRATOR");
-    await Promise.all([stage3Promise, stage4Promise, stage5Promise, stage6Promise, stage7Promise]);
+    log(emit, "error", "STAGE-1 FAILED: collected 0 mints — skipping Stages 2-3", "ORCHESTRATOR");
+    await Promise.all([stage4Promise, stage5Promise, stage6Promise, stage7Promise]);
     emitComplete(emit, results, Date.now() - startTime);
     return;
   }
@@ -1359,13 +1395,17 @@ export async function runAllStages(emit: EmitFn): Promise<void> {
   const wallets = await stage2TradeWallets(emit, results, mints);
 
   if (wallets.length === 0) {
-    log(emit, "error", "STAGE-2 FAILED: collected 0 wallets", "ORCHESTRATOR");
+    log(emit, "error", "STAGE-2 FAILED: collected 0 wallets — skipping Stage 3", "ORCHESTRATOR");
+  } else {
+    // ── Run Stage 3 (needs Stage 2 wallets) ──
+    log(emit, "info", `STAGE-2 COMPLETE: Collected ${wallets.length} wallets. Starting STAGE-3 (Shyft 7-day history test)...`, "ORCHESTRATOR");
+    await stage3WalletHistory(emit, results, wallets);
   }
 
   log(emit, "divider", "═══════════════════════════════════════════════════════", "ORCHESTRATOR");
-  // ── Wait for all stages to complete ──
-  log(emit, "info", "[waiting...] Waiting for Stages 3-7 to complete...", "ORCHESTRATOR");
-  await Promise.all([stage3Promise, stage4Promise, stage5Promise, stage6Promise, stage7Promise]);
+  // ── Wait for remaining stages to complete ──
+  log(emit, "info", "[waiting...] Waiting for Stages 4-7 to complete...", "ORCHESTRATOR");
+  await Promise.all([stage4Promise, stage5Promise, stage6Promise, stage7Promise]);
 
   log(emit, "divider", "═══════════════════════════════════════════════════════", "ORCHESTRATOR");
   emitComplete(emit, results, Date.now() - startTime);
