@@ -819,6 +819,11 @@ async function stage5DexPaprika(
   log(emit, "info", `Testing DexPaprika price stream with ${testMints.length} bonding-curve mint(s)`);
   log(emit, "info", `Mints: ${testMints.slice(0, 3).map((m) => m.slice(0, 16) + "...").join(", ")}${testMints.length > 3 ? ` +${testMints.length - 3} more` : ""}`);
 
+  // DexPaprika cannot handle bonding-curve tokens until 10+ seconds after creation
+  // Wait to ensure tokens are old enough before attempting enrichment
+  log(emit, "info", "Waiting 10s for DexPaprika bonding-curve token indexing...");
+  await new Promise(resolve => setTimeout(resolve, 10_000));
+
   const assets = testMints.map((a) => ({ chain: "solana", address: a, method: "t_p" }));
 
   let eventsReceived = 0;
