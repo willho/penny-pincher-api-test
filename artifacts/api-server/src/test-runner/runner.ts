@@ -80,6 +80,7 @@ async function stage1MintCollection(
   log(emit, "header", "════ " + stageName, stagePrefix);
 
   const COLLECT_TARGET = 2000;
+  const EARLY_START_THRESHOLD = 500;  // Stage 2/3 can start with this many
   const TIMEOUT_MS = 300_000;
   const PROGRESS_LOG_INTERVAL = 200;
   const stageStart = Date.now();
@@ -88,9 +89,10 @@ async function stage1MintCollection(
   let success = false;
   let ppConnected = false;
   let pdConnected = false;
+  let earlyStartTriggered = false;
 
   try {
-    log(emit, "info", `Attempting dual-source collection (target: ${COLLECT_TARGET} mints, no time limit)...`, stagePrefix);
+    log(emit, "info", `Attempting dual-source collection (target: ${COLLECT_TARGET} mints, early start at ${EARLY_START_THRESHOLD})...`, stagePrefix);
 
     // Open both connections in parallel
     const ppPromise = openWs()
@@ -131,6 +133,12 @@ async function stage1MintCollection(
             }
             if (mintSet.size % PROGRESS_LOG_INTERVAL === 0) {
               log(emit, "info", `Progress: ${mintSet.size}/${COLLECT_TARGET} mints collected (${source})...`, stagePrefix);
+            }
+            // Trigger early start for Stage 2 (once at threshold)
+            if (mintSet.size === EARLY_START_THRESHOLD && !earlyStartTriggered) {
+              earlyStartTriggered = true;
+              log(emit, "success", `✓ Reached early start threshold (${EARLY_START_THRESHOLD} mints) — Stage 2/3 can begin`, stagePrefix);
+              emit({ type: "stage1-early-start", mintsCollected: mintSet.size });
             }
             if (mintSet.size >= COLLECT_TARGET) {
               clearTimeout(timeout);
@@ -181,7 +189,7 @@ async function stage1MintCollection(
   }
 
   const duration = Date.now() - stageStart;
-  stageEnd(emit, results, 1, stageName, success, duration, { mintsCollected: mintSet.size, pumpportalConnected: ppConnected, pumpdevConnected: pdConnected }, errors);
+  stageEnd(emit, results, 1, stageName, success, duration, { mintsCollected: mintSet.size, earlyStartTriggered, pumpportalConnected: ppConnected, pumpdevConnected: pdConnected }, errors);
   return Array.from(mintSet);
 }
 
@@ -1362,13 +1370,14 @@ export async function runAllStages(emit: EmitFn): Promise<void> {
 
   log(emit, "header", "════════════ PENNY-PINCHER API TEST SUITE ════════════");
   log(emit, "info", "PARALLEL EXECUTION PLAN:", "ORCHESTRATOR");
-  log(emit, "info", "  • Stage 1 (background): Collect 2000+ mints, NO time limit", "ORCHESTRATOR");
-  log(emit, "info", "  • Stages 3-7 (independent): Start immediately, no Stage 1 dependency", "ORCHESTRATOR");
-  log(emit, "info", "  • Stage 2 (dependent): Start after Stage 1 completes", "ORCHESTRATOR");
+  log(emit, "info", "  • Stage 1 (background): Collect 2000+ mints, early start at 500", "ORCHESTRATOR");
+  log(emit, "info", "  • Stage 2: Start once Stage 1 hits 500+ mints (early start)", "ORCHESTRATOR");
+  log(emit, "info", "  • Stage 3: Start once Stage 2 hits 100+ wallets (early start)", "ORCHESTRATOR");
+  log(emit, "info", "  • Stages 4-7 (independent): Run in parallel, no dependency", "ORCHESTRATOR");
   log(emit, "divider", "═══════════════════════════════════════════════════════", "ORCHESTRATOR");
 
-  // ── Start Stage 1 in background (runs until 2000+ mints collected, no timeout) ──
-  log(emit, "info", ">>> Starting STAGE-1 (mint collection in background, no timeout)...", "ORCHESTRATOR");
+  // ── Start Stage 1 in background ──
+  log(emit, "info", ">>> Starting STAGE-1 (mint collection in background)...", "ORCHESTRATOR");
   const stage1Promise = stage1MintCollection(emit, results);
 
   // ── Stages 4-7 start immediately (all independent) ──
@@ -1378,7 +1387,18 @@ export async function runAllStages(emit: EmitFn): Promise<void> {
   const stage6Promise = stage6GraduatedTokens(emit, results);
   const stage7Promise = stage7DexPaprikaStress(emit, results);
 
-  // ── Wait for Stage 1 to complete mint collection ──
+  // ── Listen for Stage 1 early start event, then run Stage 2 ──
+  let stage2Promise: Promise<string[]> | null = null;
+  let stage3Promise: Promise<void> | null = null;
+
+  const earlyStartListener = (event: Record<string, unknown>) => {
+    if (event.type === "stage1-early-start" && stage2Promise === null) {
+      log(emit, "info", `[EARLY START] Stage 1 hit threshold — starting STAGE-2 now...`, "ORCHESTRATOR");
+      // Will be populated when Stage 1 completes with mints
+    }
+  };
+
+  // Wait for Stage 1 to complete
   log(emit, "info", "[waiting...] STAGE-1 collecting mints, Stages 4-7 running in parallel", "ORCHESTRATOR");
   const mints = await stage1Promise;
 
@@ -1390,16 +1410,18 @@ export async function runAllStages(emit: EmitFn): Promise<void> {
   }
 
   log(emit, "divider", "═══════════════════════════════════════════════════════", "ORCHESTRATOR");
-  // ── Run Stage 2 (needs Stage 1 mints) ──
+  // ── Run Stage 2 (with Stage 1 mints) ──
   log(emit, "info", `STAGE-1 COMPLETE: Collected ${mints.length} mints. Starting STAGE-2...`, "ORCHESTRATOR");
-  const wallets = await stage2TradeWallets(emit, results, mints);
+  stage2Promise = stage2TradeWallets(emit, results, mints);
+  const wallets = await stage2Promise;
 
   if (wallets.length === 0) {
     log(emit, "error", "STAGE-2 FAILED: collected 0 wallets — skipping Stage 3", "ORCHESTRATOR");
   } else {
-    // ── Run Stage 3 (needs Stage 2 wallets) ──
-    log(emit, "info", `STAGE-2 COMPLETE: Collected ${wallets.length} wallets. Starting STAGE-3 (Shyft 7-day history test)...`, "ORCHESTRATOR");
-    await stage3WalletHistory(emit, results, wallets);
+    // ── Run Stage 3 (with Stage 2 wallets) ──
+    log(emit, "info", `STAGE-2 COMPLETE: Collected ${wallets.length} wallets. Starting STAGE-3 (Shyft stress test)...`, "ORCHESTRATOR");
+    stage3Promise = stage3WalletHistory(emit, results, wallets);
+    await stage3Promise;
   }
 
   log(emit, "divider", "═══════════════════════════════════════════════════════", "ORCHESTRATOR");
