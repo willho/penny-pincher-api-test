@@ -1218,15 +1218,36 @@ async function stage7DexPaprikaStress(
 
   // Validate tokens before sending (filter out invalid addresses) - use only graduated tokens
   const validTokens = graduatedMints.filter(a => {
-    // Basic validation: Solana addresses are 43-44 chars, alphanumeric
-    return a && a.length >= 40 && a.length <= 50 && /^[A-Za-z0-9]+$/.test(a);
+    if (!a || typeof a !== 'string') return false;
+    // Solana addresses must be exactly 43-44 chars, alphanumeric + some special chars (/, +)
+    if (a.length < 43 || a.length > 44) return false;
+    // Must be valid base58 (Solana uses base58)
+    if (!/^[1-9A-HJ-NP-Z]+$/.test(a)) return false;
+    // Skip if it looks like a URL or contains special patterns that suggest invalid data
+    if (a.includes('.') || a.includes('/') || a.includes('http')) return false;
+    return true;
   });
 
-  if (validTokens.length < allTokens.length) {
-    log(emit, "warn", `Filtered out ${allTokens.length - validTokens.length} invalid token addresses`);
+  if (validTokens.length < graduatedMints.length) {
+    log(emit, "warn", `Filtered out ${graduatedMints.length - validTokens.length} invalid token addresses`);
+  }
+
+  if (validTokens.length === 0) {
+    errors.push("No valid graduated token addresses after filtering");
+    log(emit, "error", "✗ No valid tokens to test");
+    stageEnd(emit, results, 7, stageName, false, Date.now() - stageStart, {
+      bondingCurveTokens: bondingMints.length, graduatedTokens: graduatedMints.length, tokensSubscribed: 0, totalEvents: 0,
+      note: "All tokens filtered out as invalid",
+    }, errors);
+    return;
   }
 
   const assets = validTokens.map((a) => ({ chain: "solana", address: a, method: "t_p" }));
+
+  // DexPaprika may need time to index newly graduated tokens
+  // Wait before attempting to subscribe to avoid "asset not found" errors
+  log(emit, "info", "Waiting 10s for DexPaprika to index tokens...");
+  await new Promise(resolve => setTimeout(resolve, 10_000));
 
   let totalEvents = 0;
   const tokenUpdateCounts = new Map<string, number>();
