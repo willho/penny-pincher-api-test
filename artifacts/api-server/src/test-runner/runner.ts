@@ -1244,11 +1244,6 @@ async function stage7DexPaprikaStress(
 
   const assets = validTokens.map((a) => ({ chain: "solana", address: a, method: "t_p" }));
 
-  // DexPaprika may need time to index newly graduated tokens
-  // Wait before attempting to subscribe to avoid "asset not found" errors
-  log(emit, "info", "Waiting 10s for DexPaprika to index tokens...");
-  await new Promise(resolve => setTimeout(resolve, 10_000));
-
   let totalEvents = 0;
   const tokenUpdateCounts = new Map<string, number>();
   let httpStatus: number | undefined;
